@@ -68,8 +68,13 @@ class PageFlagsBase {
   PageFlagsBase& operator=(PageFlagsBase&&) = delete;
   virtual std::optional<bool> IsHugepageBacked(const void* addr) = 0;
   virtual std::optional<PageStats> Get(const void* addr, size_t size) = 0;
-  virtual absl::StatusCode GetSinglePageBitmaps(const void* addr,
-                                                ResidencyBitmap& stale) = 0;
+
+  struct PageFlagsBitmaps {
+    ResidencyBitmap stale;
+    absl::StatusCode status;
+  };
+
+  virtual PageFlagsBitmaps GetSinglePageBitmaps(const void* addr) = 0;
 };
 
 // PageFlags offers a look at kernel page flags to identify pieces of memory as
@@ -101,8 +106,7 @@ class PageFlags final : public PageFlagsBase {
   // dynamically allocate memory when needed.  Using std::optional allows us to
   // use the function in places where memory allocation is prohibited.
   std::optional<PageStats> Get(const void* addr, size_t size) override;
-  absl::StatusCode GetSinglePageBitmaps(const void* addr,
-                                        ResidencyBitmap& stale) override;
+  PageFlagsBitmaps GetSinglePageBitmaps(const void* addr) override;
   std::optional<bool> IsHugepageBacked(const void* addr) override;
 
  private:
@@ -136,13 +140,13 @@ class PageFlags final : public PageFlagsBase {
   static constexpr int kPagemapEntrySize = 8;
   static constexpr int kEntriesInBuf = kBufferLength / kPagemapEntrySize;
 
-  const size_t kPageSize = GetPageSize();
+  const size_t kHardwarePageSize = GetPageSize();
   // You can technically not hard-code this but it would involve many more
   // queries to figure out the size of every page. It's a lot easier to just
   // assume any compound pages are 2 MB.
   static constexpr int kHugePageSize = (2 << 20);
   static constexpr uintptr_t kHugePageMask = ~(kHugePageSize - 1);
-  const size_t kPagesInHugePage = kHugePageSize / kPageSize;
+  const size_t kPagesInHugePage = kHugePageSize / kHardwarePageSize;
 
   uint64_t buf_[kEntriesInBuf];
   // Information about the previous head page. For any future-encountered tail

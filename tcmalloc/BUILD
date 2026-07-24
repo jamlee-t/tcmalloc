@@ -48,7 +48,7 @@ cc_library(
     copts = TCMALLOC_DEFAULT_COPTS,
     visibility = [
         "//tcmalloc:__subpackages__",
-        "//tcmalloc:friends",
+        "@do_not_use_for_gloop_visibility_only//gloop:__subpackages__",
     ],
     deps = [
         ":malloc_extension",
@@ -791,7 +791,9 @@ cc_test(
     copts = TCMALLOC_DEFAULT_COPTS + TCMALLOC_DEFAULT_CXXOPTS,
     deps = [
         ":common_8k_pages",
+        "//tcmalloc/internal:config",
         "//tcmalloc/internal:logging",
+        "//tcmalloc/internal:sampled_allocation",
         "//tcmalloc/testing:testutil",
         "@com_google_absl//absl/types:span",
         "@com_google_fuzztest//fuzztest",
@@ -806,8 +808,8 @@ cc_test(
     copts = TCMALLOC_DEFAULT_COPTS + TCMALLOC_DEFAULT_CXXOPTS,
     deps = [
         ":common_8k_pages",
+        "//tcmalloc/internal:config",
         "//tcmalloc/internal:size_class_info",
-        "@com_google_absl//absl/log:check",
         "@com_google_absl//absl/types:span",
         "@com_google_fuzztest//fuzztest",
         "@com_google_fuzztest//fuzztest:fuzztest_gtest_main",
@@ -1066,6 +1068,7 @@ cc_test(
     srcs = ["guarded_page_allocator_test.cc"],
     copts = TCMALLOC_DEFAULT_COPTS,
     malloc = "//tcmalloc",
+    tags = ["nohwasan"],
     deps = [
         ":common_8k_pages",
         ":malloc_extension",
@@ -1225,7 +1228,6 @@ create_tcmalloc_testsuite(
     copts = TCMALLOC_DEFAULT_COPTS,
     deps = [
         "//tcmalloc/internal:config",
-        "//tcmalloc/internal:parameter_accessors",
         "//tcmalloc/internal:size_class_info",
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/random",
@@ -1464,6 +1466,7 @@ cc_test(
         "@com_google_absl//absl/base:core_headers",
         "@com_google_absl//absl/container:fixed_array",
         "@com_google_absl//absl/container:flat_hash_map",
+        "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/memory",
         "@com_google_absl//absl/numeric:bits",
         "@com_google_absl//absl/random",
@@ -1483,10 +1486,17 @@ create_tcmalloc_benchmark(
     malloc = "//tcmalloc",
     deps = [
         ":common_8k_pages",
-        ":mock_static_forwarder_8k_pages",
+        "//tcmalloc/internal:bytes",
+        "//tcmalloc/internal:config",
+        "//tcmalloc/internal:logging",
         "@com_github_google_benchmark//:benchmark",
         "@com_google_absl//absl/algorithm:container",
+        "@com_google_absl//absl/base",
+        "@com_google_absl//absl/base:core_headers",
+        "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/random",
+        "@com_google_absl//absl/synchronization",
+        "@com_google_absl//absl/time",
         "@com_google_absl//absl/types:span",
     ],
 )
@@ -1597,6 +1607,7 @@ cc_library(
     textual_hdrs = ["malloc_hook_invoke.h"],
     visibility = [
         ":__subpackages__",
+        "@do_not_use_for_gloop_visibility_only//gloop/base:__pkg__",
     ],
     deps = [
         "//tcmalloc/internal:config",
@@ -1628,10 +1639,4 @@ cc_library(
         "@com_google_absl//absl/base:core_headers",
     ],
     alwayslink = 1,
-)
-
-# Expose internals to privileged external repositories.
-package_group(
-    name = "friends",
-    packages = [],
 )

@@ -57,6 +57,9 @@ class FakeStaticForwarder {
   }
   bool release_partial_alloc_pages() { return release_partial_alloc_pages_; }
   bool hpaa_subrelease() const { return hpaa_subrelease_; }
+  SubreleaseUnbackedMode subrelease_unbacked_hugepages() const {
+    return subrelease_unbacked_hugepages_;
+  }
 
   void set_filler_skip_subrelease_short_interval(absl::Duration value) {
     short_interval_ = value;
@@ -68,6 +71,9 @@ class FakeStaticForwarder {
     release_partial_alloc_pages_ = value;
   }
   void set_hpaa_subrelease(bool value) { hpaa_subrelease_ = value; }
+  void set_subrelease_unbacked_hugepages(SubreleaseUnbackedMode value) {
+    subrelease_unbacked_hugepages_ = value;
+  }
   bool release_succeeds() const { return release_succeeds_; }
   void set_release_succeeds(bool value) { release_succeeds_ = value; }
   void set_collapse_succeeds(bool value) { collapse_succeeds_ = value; }
@@ -84,6 +90,10 @@ class FakeStaticForwarder {
   }
   void set_huge_region_adaptive_release(bool value) {
     huge_region_adaptive_release_ = value;
+  }
+  bool release_max_cold_pages() const { return release_max_cold_pages_; }
+  void set_release_max_cold_pages(bool value) {
+    release_max_cold_pages_ = value;
   }
 
   bool BackAllocations() const { return back_allocations_; }
@@ -215,11 +225,14 @@ class FakeStaticForwarder {
   absl::Duration cache_demand_release_long_interval_ = absl::Seconds(30);
   bool release_partial_alloc_pages_ = false;
   bool hpaa_subrelease_ = true;
+  SubreleaseUnbackedMode subrelease_unbacked_hugepages_ =
+      SubreleaseUnbackedMode::kEnabled;
   bool release_succeeds_ = true;
   bool collapse_succeeds_ = true;
   int error_number_ = 0;
   bool huge_region_demand_based_release_ = false;
   bool huge_region_adaptive_release_ = false;
+  bool release_max_cold_pages_ = false;
 
   bool back_allocations_ = false;
   int32_t back_size_threshold_bytes_ = kPageSize;

@@ -86,7 +86,7 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
   constexpr Span()
       : embed_count_(0),
         freelist_(0),
-        allocated_(std::numeric_limits<uint16_t>::max()),
+        allocated_{std::numeric_limits<uint16_t>::max()},
         cache_size_(0),
         is_long_lived_span_(0),
         nonempty_index_(0),
@@ -100,7 +100,7 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
   explicit Span(Range r)
       : embed_count_(0),
         freelist_(0),
-        allocated_(0),
+        allocated_{0},
         cache_size_(0),
         is_long_lived_span_(0),
         nonempty_index_(0),
@@ -183,10 +183,6 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
   // Total memory bytes in the span.
   size_t bytes_in_span() const;
 
-  // Returns internal fragmentation of the span.
-  // REQUIRES: this is a SMALL_OBJECT span.
-  double Fragmentation(size_t object_size) const;
-
   // Returns number of objects allocated in the span.
   uint16_t Allocated() const {
     return allocated_.load(std::memory_order_relaxed);
@@ -209,7 +205,8 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
   // Indicate whether the Span is empty. Size is used to determine whether
   // the span is using a compressed linked list of objects, or a bitmap
   // to hold available objects.
-  bool FreelistEmpty(size_t size) const;
+  [[nodiscard]] bool FreelistEmpty(size_t size,
+                                   uint32_t objects_per_span) const;
 
   // Pushes ptr onto freelist unless the freelist becomes full, in which case
   // just return false.
@@ -307,7 +304,18 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
     uint16_t embed_count_;
     uint16_t freelist_;
   };
-  std::atomic<uint16_t> allocated_;  // Number of non-free objects
+#ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  std::atomic<uint16_t>
+#else
+  struct {
+    uint16_t value;
+
+    uint16_t load(std::memory_order) const { return value; }
+
+    void store(uint16_t v, std::memory_order) { value = v; }
+  }
+#endif
+      allocated_;  // Number of non-free objects
 #ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
   uint8_t cache_size_;
 #else
@@ -409,6 +417,8 @@ class ABSL_CACHELINE_ALIGNED Span final : public SpanList::Elem {
 
   [[noreturn]] void ReportDoubleFree(const void* ptr);
 
+  ABSL_ATTRIBUTE_RETURNS_NONNULL SampledAllocation* UnsampleSlow();
+
   // Friend class to enable more indepth testing of bitmap code.
   friend class SpanTestPeer;
 };
@@ -455,9 +465,9 @@ inline bool Span::FreelistPushBatch(absl::Span<T> batch, size_t size,
     return false;
   }
   allocated_.store(allocated - batch.size(), std::memory_order_relaxed);
-  // Bitmaps are used to record object availability when there are fewer than
-  // 64 objects in a span.
-  if (ABSL_PREDICT_FALSE(UseBitmapForSize(size))) {
+  // Bitmaps are used to record object availability when there are no more than
+  // kBitmapSize objects in a span.
+  if (ABSL_PREDICT_TRUE(UseBitmapForSize(size))) {
     return BitmapPushBatch(batch, size, reciprocal);
   }
   return ListPushBatch(batch, size);
@@ -530,21 +540,43 @@ inline bool Span::ListPushBatch(absl::Span<Span::ObjIdx> batch,
 
   const uintptr_t start = absl::bit_cast<uintptr_t>(start_address());
 
+  ObjIdx freelist = freelist_;
+  uint16_t embed_count = embed_count_;
+
+  ObjIdx* __restrict host;
+  if (ABSL_PREDICT_TRUE(freelist != kListEnd)) {
+    host = IdxToPtr(freelist, size, start);
+  } else {
+    ObjIdx idx = batch[0];
+    batch.remove_prefix(1);
+
+    host = IdxToPtr(idx, size, start);
+    *host = kListEnd;
+    freelist = idx;
+    embed_count = 0;
+  }
+
+  TC_ASSERT_NE(freelist, kListEnd);
+
+  // -1 because the first slot is used by freelist link.
+  const size_t limit = size / sizeof(ObjIdx) - 1;
+
   for (const ObjIdx idx : batch) {
-    if (ABSL_PREDICT_TRUE(freelist_ != kListEnd) &&
-        // -1 because the first slot is used by freelist link.
-        ABSL_PREDICT_TRUE(embed_count_ != size / sizeof(ObjIdx) - 1)) {
+    if (ABSL_PREDICT_TRUE(embed_count != limit)) {
       // Push onto the first object on freelist.
-      ObjIdx* __restrict host = IdxToPtr(freelist_, size, start);
-      embed_count_++;
-      host[embed_count_] = idx;
+      embed_count++;
+      host[embed_count] = idx;
     } else {
       // Push onto freelist.
-      *reinterpret_cast<ObjIdx*>(IdxToPtr(idx, size, start)) = freelist_;
-      freelist_ = idx;
-      embed_count_ = 0;
+      ObjIdx* __restrict new_host = IdxToPtr(idx, size, start);
+      *new_host = freelist;
+      freelist = idx;
+      embed_count = 0;
+      host = new_host;
     }
   }
+  freelist_ = freelist;
+  embed_count_ = embed_count;
   return true;
 }
 
@@ -657,16 +689,28 @@ inline size_t Span::bytes_in_span() const ABSL_NO_THREAD_SAFETY_ANALYSIS {
   return Length(small_span_state_.num_pages).in_bytes();
 }
 
-inline bool Span::FreelistEmpty(size_t size) const {
+inline bool Span::FreelistEmpty(size_t size, uint32_t objects_per_span) const {
   TC_ASSERT(!is_large_or_sampled());
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  (void)size;
+  return allocated_.load(std::memory_order_relaxed) == objects_per_span;
+#else
+  (void)objects_per_span;
   if (UseBitmapForSize(size)) {
     return small_span_state_.bitmap.IsZero();
   } else {
     return cache_size_ == 0 && freelist_ == kListEnd;
   }
+#endif
 }
 
-inline void Span::Prefetch() { PrefetchT0(this); }
+inline void Span::Prefetch() {
+#ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  PrefetchT0(this);
+#else
+  PrefetchW(this);
+#endif
+}
 
 inline bool Span::IsValidSizeClass(size_t size, Length pages) {
   if (pages > kLargeSpanLength) return false;
@@ -724,7 +768,7 @@ inline size_t Span::FreelistPopBatch(const absl::Span<void*> batch,
   TC_ASSERT(!is_large_or_sampled());
   // Handle spans with bitmap.size() or fewer objects using a bitmap. We expect
   // spans to frequently hold smaller objects.
-  if (ABSL_PREDICT_FALSE(UseBitmapForSize(size))) {
+  if (ABSL_PREDICT_TRUE(UseBitmapForSize(size))) {
     return BitmapPopBatch(batch, size);
   }
   return ListPopBatch(batch.data(), batch.size(), size);
@@ -783,6 +827,13 @@ inline size_t Span::ListPopBatch(void** __restrict batch, size_t N,
   allocated_.store(allocated_.load(std::memory_order_relaxed) + result,
                    std::memory_order_relaxed);
   return result;
+}
+
+inline SampledAllocation* absl_nullable Span::Unsample() {
+  if (!sampled_) {
+    return nullptr;
+  }
+  return UnsampleSlow();
 }
 
 }  // namespace tcmalloc_internal

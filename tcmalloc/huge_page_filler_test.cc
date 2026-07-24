@@ -289,10 +289,11 @@ class FakePageFlags : public PageFlagsBase {
     return PageStats{};
   }
 
-  absl::StatusCode GetSinglePageBitmaps(const void* addr,
-                                        ResidencyBitmap& stale) override {
-    stale.SetBit(0);
-    return absl::StatusCode::kOk;
+  PageFlagsBitmaps GetSinglePageBitmaps(const void* addr) override {
+    PageFlagsBitmaps ret;
+    ret.stale.SetBit(0);
+    ret.status = absl::StatusCode::kOk;
+    return ret;
   }
 
   void MarkHugePageBacked(void* addr, bool is_hugepage_backed) {
@@ -344,9 +345,9 @@ class FakeResidency : public Residency {
                                            absl::StatusCode::kOk};
   }
 
-  const size_t kNativePagesInHugePage = kHugePageSize / kPageSize;
-  size_t GetNativePagesInHugePage() const override {
-    return kNativePagesInHugePage;
+  const size_t kHardwarePagesInHugePage = kHugePageSize / kPageSize;
+  size_t GetHardwarePagesInHugePage() const override {
+    return kHardwarePagesInHugePage;
   };
 
  private:
@@ -932,15 +933,18 @@ class FillerTest : public testing::Test {
   // filler inits), so its time series has the same initial state (e.g., first
   // epoch)
   ClockResetter clock_resetter_;
+  SubreleaseUnbackedMode mode_ = SubreleaseUnbackedMode::kDisabled;
   HugePageFiller<PageTracker> filler_;
   BlockingUnback blocking_unback_;
   MockCollapse collapse_;
   MockSetAnonVmaName set_anon_vma_name_;
 
-  FillerTest()
-      : filler_(Clock{.now = FakeClock::now, .freq = FakeClock::freq},
+  explicit FillerTest(
+      SubreleaseUnbackedMode mode = SubreleaseUnbackedMode::kDisabled)
+      : mode_(mode),
+        filler_(Clock{.now = FakeClock::now, .freq = FakeClock::freq},
                 MemoryTag::kNormal, blocking_unback_, blocking_unback_,
-                collapse_, set_anon_vma_name_) {
+                collapse_, set_anon_vma_name_, mode) {
     // Reset success state
     blocking_unback_.success_ = true;
   }
@@ -1193,6 +1197,12 @@ class FillerTest : public testing::Test {
 };
 
 int64_t FillerTest::clock_{1234};
+
+class FillerTestWithSubreleaseUnbacked : public FillerTest {
+ public:
+  FillerTestWithSubreleaseUnbacked()
+      : FillerTest(SubreleaseUnbackedMode::kEnabled) {}
+};
 
 TEST_F(FillerTest, Density) {
   absl::BitGen rng;
@@ -2316,6 +2326,294 @@ TEST_F(FillerTest, CollapseClock) {
   DeleteVector(p1);
 }
 
+// This test confirms that when enable_subrelease_unbacked is set to true,
+// unbacked native pages on non-hugepage-backed trackers are marked as
+// subreleased and treatment statistics are updated accordingly.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedPages) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(1);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(1));
+  EXPECT_EQ(GetHugePageTreatmentStats().treated_pages_unbacked_subreleased, 1);
+  DeleteVector(p1);
+}
+
+// This test confirms that when enable_subrelease_unbacked is set to false,
+// no unbacked pages are subreleased from non-hugepage-backed trackers.
+TEST_F(FillerTest, SubreleaseUnbackedPagesDisabled) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(1);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(0));
+  EXPECT_EQ(GetHugePageTreatmentStats().treated_pages_unbacked_subreleased, 0);
+  DeleteVector(p1);
+}
+
+// This test confirms that after subreleasing unbacked pages from a
+// non-hugepage-backed tracker, the tracker transitions to the released
+// list and is correctly classified in telemetry reports.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedTelemetry) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(10);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  std::string buffer_text = PrintToString(1024 * 1024, [&](Printer& printer) {
+    PageHeapSpinLockHolder l;
+    filler_.Print(printer, /*everything=*/true, pageflags);
+  });
+
+  EXPECT_THAT(buffer_text,
+              testing::HasSubstr(
+                  "HugePageFiller: Of the non-hugepage backed pages of type "
+                  "sparsely-accessed released, 0 tcmalloc pages are free, 246 "
+                  "tcmalloc pages are used."));
+
+  DeleteVector(p1);
+}
+
+// This test confirms that when only a subset of free pages on a
+// non-hugepage-backed tracker are subreleased, the tracker transitions to the
+// partial released list and is correctly classified in telemetry reports.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedPartial) {
+  randomize_density_ = false;
+  PAlloc p1 = Allocate(Length(240));
+  PAlloc p2 = AllocateWithSpanAllocInfo(Length(8), p1.span_alloc_info);
+  PAlloc p3 = AllocateWithSpanAllocInfo(Length(8), p1.span_alloc_info);
+  ASSERT_EQ(p2.pt, p1.pt);
+  ASSERT_EQ(p3.pt, p1.pt);
+
+  Delete(p2);
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  pageflags.MarkHugePageBacked(p1.p.start_addr(), /*is_hugepage_backed=*/false);
+  Bitmap<kMaxResidencyBits> unbacked, swapped;
+  unbacked.SetRange(0, kMaxResidencyBits);
+  residency.SetUnbackedAndSwappedBitmaps(p1.p.start_addr(), unbacked, swapped);
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  Delete(p3);
+
+  std::string buffer_text = PrintToString(1024 * 1024, [&](Printer& printer) {
+    PageHeapSpinLockHolder l;
+    filler_.Print(printer, /*everything=*/true, pageflags);
+  });
+
+  EXPECT_THAT(buffer_text,
+              testing::HasSubstr(
+                  "HugePageFiller: Of the non-hugepage backed pages of type "
+                  "sparsely-accessed partial released, 8 tcmalloc pages are "
+                  "free, 240 tcmalloc pages are used."));
+
+  Delete(p1);
+}
+
+// This test confirms that when only some (but not all) native pages within a
+// free TCMalloc page are unbacked, the TCMalloc page is NOT marked as
+// subreleased.
+TEST_F(FillerTestWithSubreleaseUnbacked,
+       SubreleaseUnbackedPartialHardwarePages) {
+  const size_t kHardwarePagesInHugePage = kHugePageSize / kPageSize;
+  const int shift = kHardwarePagesInHugePage / kPagesPerHugePage.raw_num();
+  if (shift <= 1) {
+    return;
+  }
+
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(10);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    for (size_t j = 0; j < kMaxResidencyBits; j += 2) {
+      unbacked.SetBit(j);
+    }
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(0));
+
+  DeleteVector(p1);
+}
+
+// This test confirms that when both unbacked and swapped subrelease are
+// enabled, they operate correctly together.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedAndSwapped) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(2);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    swapped.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(2));
+  DeleteVector(p1);
+}
+
+// This test confirms that if a tracker is partially subreleased via
+// unbacked subrelease, subsequent allocations claim its remaining free and
+// released pages and successfully transition it back to regular state.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedRecovery) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(10);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(10));
+
+  std::vector<PAlloc> p2 = AllocateVector(Length(10));
+  ASSERT_TRUE(!p2.empty());
+  for (const auto& pa : p2) {
+    EXPECT_EQ(pa.pt, p1.front().pt);
+  }
+
+  DeleteVector(p2);
+  DeleteVector(p1);
+}
+
+// This test confirms that when a tracker is hugepage backed, unbacked
+// subrelease is skipped.
+TEST_F(FillerTestWithSubreleaseUnbacked,
+       SubreleaseUnbackedSkippedWhenHugepageBacked) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(1);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/true);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(0));
+  DeleteVector(p1);
+}
+
+// This test confirms that when enable_subrelease_unbacked is set to true,
+// unbacked native pages on donated trackers are marked as subreleased.
+TEST_F(FillerTestWithSubreleaseUnbacked, SubreleaseUnbackedDonated) {
+  randomize_density_ = false;
+  const Length kAlloc = kPagesPerHugePage - Length(1);
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc, /*donated=*/true);
+  ASSERT_TRUE(!p1.empty());
+
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  for (const auto& pa : p1) {
+    pageflags.MarkHugePageBacked(pa.p.start_addr(),
+                                 /*is_hugepage_backed=*/false);
+    Bitmap<kMaxResidencyBits> unbacked, swapped;
+    unbacked.SetRange(0, kMaxResidencyBits);
+    residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked,
+                                           swapped);
+  }
+
+  TreatHugepageTrackers(EnableCollapse::kDisabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(1));
+  EXPECT_EQ(GetHugePageTreatmentStats().treated_pages_unbacked_subreleased, 1);
+  DeleteVector(p1);
+}
+
 // This test makes sure that we continue releasing from regular (non-partial)
 // allocs when we enable a feature to release all free pages from partial
 // allocs.
@@ -2616,6 +2914,263 @@ TEST_F(FillerTest, ReleaseZero) {
       ReleasePages(Length(0),
                    SkipSubreleaseIntervals{.peak_interval = absl::Seconds(1)}),
       Length(0));
+}
+
+// Verifies that the filler prefers allocating from fully backed (unbroken)
+// hugepages over broken (partially unbacked) ones to avoid page faults.
+TEST_F(FillerTestWithSubreleaseUnbacked, PreferFullyBackedOverUnbackedBroken) {
+  randomize_density_ = false;
+
+  // 1. Create Tracker A (to be hugepage backed).
+  // Allocate 10 pages.
+  PAlloc a = Allocate(Length(10));
+
+  // 2. Create Tracker B (to be non-hugepage backed).
+  // Allocate 5 pages. Force new tracker by marking as donated.
+  PAlloc b = Allocate(Length(5), /*donated=*/true);
+
+  // We should have 2 hugepages in the filler.
+  EXPECT_EQ(filler_.size(), NHugePages(2));
+
+  // Both should be unbroken initially.
+  EXPECT_TRUE(a.pt->unbroken());
+  EXPECT_TRUE(b.pt->unbroken());
+
+  // Setup FakePageFlags and FakeResidency.
+  FakePageFlags pageflags;
+  FakeResidency residency;
+
+  // Mark A as hugepage backed.
+  pageflags.MarkHugePageBacked(a.p.start_addr(), /*is_hugepage_backed=*/true);
+
+  // Mark B as non-hugepage backed, with no unbacked/swapped pages.
+  pageflags.MarkHugePageBacked(b.p.start_addr(), /*is_hugepage_backed=*/false);
+  Bitmap<kMaxResidencyBits> empty_unbacked, empty_swapped;
+  residency.SetUnbackedAndSwappedBitmaps(b.p.start_addr(), empty_unbacked,
+                                         empty_swapped);
+
+  // Set collapse to fail so that we fail to collapse Tracker B.
+  collapse_.SetSuccess(/*success=*/false);
+  collapse_.SetErrorNumber(EINVAL);
+
+  // Trigger treatment.
+  // We want to run with:
+  // - EnableCollapse::kEnabled
+  // - SubreleaseUnbackedMode::kEnabled
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  // Verify their unbroken status after treatment.
+  // A should still be unbroken.
+  // B should now be marked broken (unbroken = false).
+  EXPECT_TRUE(a.pt->unbroken());
+  EXPECT_FALSE(b.pt->unbroken());
+
+  // Both A and B have 0 released pages (we didn't actually release anything).
+  EXPECT_EQ(a.pt->released_pages(), Length(0));
+  EXPECT_EQ(b.pt->released_pages(), Length(0));
+
+  // Allocate 2 pages. Both A and B have enough free space.
+  // We should prefer A because it is fully backed (unbroken).
+  PAlloc c = Allocate(Length(2));
+
+  // Verify that the allocation came from A.
+  EXPECT_EQ(c.pt, a.pt);
+  EXPECT_FALSE(c.from_released);
+
+  // Clean up.
+  Delete(a);
+  Delete(b);
+  Delete(c);
+}
+
+// Verifies that if all released pages in a broken tracker are re-allocated
+// (rendering the tracker residency state invalid), a subsequent successful
+// collapse correctly restores the tracker's unbroken status.
+TEST_F(FillerTestWithSubreleaseUnbacked,
+       CollapseSucceedsAfterAllocationInvalidatesEntryValid) {
+  randomize_density_ = false;
+
+  // 1. Create a tracker.
+  // Allocate 10 pages.
+  PAlloc a = Allocate(Length(10));
+  EXPECT_TRUE(a.pt->unbroken());
+
+  // Setup FakePageFlags and FakeResidency.
+  FakePageFlags pageflags;
+  FakeResidency residency;
+
+  // Mark A as non-hugepage backed.
+  pageflags.MarkHugePageBacked(a.p.start_addr(), /*is_hugepage_backed=*/false);
+
+  // Set 5 pages as unbacked in residency.
+  // Tracker has 10 used pages (0-9), and 246 free pages (10-255).
+  // Let's mark pages 10-14 as unbacked in the kernel.
+  Bitmap<kMaxResidencyBits> unbacked, swapped;
+  // Page size is 8KB, native page size is 4KB.
+  // So 2 native pages per TCMalloc page.
+  // TCMalloc pages 10-14 correspond to native pages 20-29.
+  unbacked.SetRange(20, 10);  // 10 native pages = 5 TCMalloc pages.
+  residency.SetUnbackedAndSwappedBitmaps(a.p.start_addr(), unbacked, swapped);
+
+  // 2. Mark collapse as failed.
+  collapse_.SetSuccess(/*success=*/false);
+  collapse_.SetErrorNumber(EINVAL);
+
+  // 3. Trigger treatment (collapse fails, subrelease happens).
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  // 4. Verify it is marked broken and has released pages.
+  EXPECT_FALSE(a.pt->unbroken());
+  EXPECT_EQ(a.pt->released_pages(), Length(5));
+
+  // 5. Allocate from it.
+  // Since we have 5 released pages (10-14), allocating 5 pages should
+  // allocate them and re-back them.
+  PAlloc b = Allocate(Length(5));
+  EXPECT_EQ(b.pt, a.pt);
+  EXPECT_TRUE(b.from_released);
+
+  // Now all released pages should be allocated.
+  EXPECT_EQ(a.pt->released_pages(), Length(0));
+
+  // Verify that entry_valid remains true.
+  PageTracker::HugePageResidencyState state = a.pt->GetHugePageResidencyState();
+  EXPECT_TRUE(state.entry_valid);
+
+  // Advance the clock to exceed kRecordInterval (5 minutes) so that the tracker
+  // is revisited for collapse.
+  FakeClock::Advance(absl::Minutes(6));
+
+  // 6. Treat the tracker again with collapse set to success.
+  collapse_.SetSuccess(/*success=*/true);
+
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  // 7. Confirm that the tracker is marked unbroken.
+  EXPECT_TRUE(a.pt->unbroken());
+
+  // Clean up.
+  Delete(a);
+  Delete(b);
+}
+
+// Verifies that when collapse fails on a tracker whose free pages are backed
+// in residency, the tracker is moved to the partially_released list without
+// releasing any pages, and that a subsequent successful collapse moves it
+// back to the regular list.
+TEST_F(FillerTestWithSubreleaseUnbacked, CollapsePartiallyReleasedTrackers) {
+  randomize_density_ = false;
+  const Length N = kPagesPerHugePage;
+  const Length kAlloc = N - Length(5);
+
+  // 1. A tracker has some used pages, rest are free, so it is in a regular_list
+  // at first.
+  std::vector<PAlloc> p1 = AllocateVector(kAlloc);
+  ASSERT_EQ(filler_.size(), NHugePages(1));
+  PAlloc pa = p1.front();
+  EXPECT_TRUE(pa.pt->unbroken());
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+
+  // Setup FakePageFlags and FakeResidency.
+  FakePageFlags pageflags;
+  FakeResidency residency;
+
+  // Mark pa as non-hugepage backed.
+  pageflags.MarkHugePageBacked(pa.p.start_addr(), /*is_hugepage_backed=*/false);
+  Bitmap<kMaxResidencyBits> unbacked, swapped;
+  residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked, swapped);
+
+  // 2. Set collapse to fail, set free page as backed in residency, treat the
+  // tracker. Nothing is released, but tracker is moved to the
+  // partially_released list. confirm that.
+  collapse_.SetSuccess(/*success=*/false);
+  collapse_.SetErrorNumber(EINVAL);
+
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  EXPECT_FALSE(pa.pt->unbroken());
+  EXPECT_EQ(pa.pt->released_pages(), Length(0));
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, Length(0));
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), kAlloc);
+
+  // 3. Set collapse to succeed next, advance the clock so that the tracker may
+  // be treated again.
+  collapse_.SetSuccess(/*success=*/true);
+  FakeClock::Advance(absl::Minutes(6));
+
+  // 4. Treat the trackers. Now the tracker should be successfully collapsed.
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  EXPECT_TRUE(pa.pt->unbroken());
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(0));
+
+  // Clean up.
+  DeleteVector(p1);
+}
+
+// Verifies that unbacked subrelease applies to trackers in released lists,
+// subreleasing their free unbacked pages without collapsing the tracker.
+TEST_F(FillerTestWithSubreleaseUnbacked, GardenReleasedTrackers) {
+  randomize_density_ = false;
+  const Length N = kPagesPerHugePage;
+
+  // 1. A tracker with some used pages, some free but unbacked pages, and some
+  // released pages. Confirm this tracker is in one of the released lists.
+  std::vector<PAlloc> p1 = AllocateVector(Length(10));
+  ASSERT_EQ(filler_.size(), NHugePages(1));
+  PAlloc pa = p1.front();
+
+  // Release all remaining 246 free pages.
+  EXPECT_EQ(ReleasePages(N - Length(10)), N - Length(10));
+  EXPECT_EQ(pa.pt->released_pages(), N - Length(10));
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(10));
+
+  // Allocate 5 pages from the released pages, then free them without releasing.
+  std::vector<PAlloc> p2 = AllocateVector(Length(5));
+  DeleteVector(p2);
+  // Now we have 10 used pages, 5 free (unreleased) pages, and 241 released
+  // pages.
+  EXPECT_EQ(pa.pt->released_pages(), N - Length(15));
+  EXPECT_EQ(filler_.used_pages_in_partial_released(), Length(10));
+
+  // Mark the 5 free pages (TCMalloc pages 10 to 14) as unbacked.
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  pageflags.MarkHugePageBacked(pa.p.start_addr(), /*is_hugepage_backed=*/false);
+  Bitmap<kMaxResidencyBits> unbacked, swapped;
+  // TCMalloc page 10 corresponds to native page 20 (assuming 2 native pages per
+  // TCMalloc page).
+  unbacked.SetRange(20, 10);
+  residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked, swapped);
+
+  // 2. Treat this tracker.
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  // 3. Confirm it isn't collapsed and remains broken.
+  EXPECT_FALSE(collapse_.TriedCollapse(pa.p.start_addr()));
+  EXPECT_FALSE(pa.pt->unbroken());
+
+  // 4. Confirm that treatment marks free but unbacked pages as released as
+  // well. We had 241 released pages. Now we should have 241 + 5 = 246 released
+  // pages.
+  EXPECT_EQ(pa.pt->released_pages(), N - Length(10));
+  EXPECT_EQ(filler_.subrelease_stats().total_pages_subreleased, N - Length(5));
+  EXPECT_EQ(GetHugePageTreatmentStats().treated_pages_unbacked_subreleased, 5);
+
+  // Clean up.
+  DeleteVector(p1);
 }
 
 void FillerTest::FragmentationTest() {
@@ -3145,6 +3700,82 @@ TEST_F(FillerTest, CheckFullReleasedFullReleasedState) {
               testing::HasSubstr("HugePageFiller: 0 hugepages became full "
                                  "after being previously released, "
                                  "out of which 0 pages are hugepage backed."));
+}
+
+// Verifies the end-to-end state transitions of a hugepage's unbroken status
+// under the filler: it becomes broken upon subrelease, remains broken even
+// after being fully allocated, and only returns to unbroken after a successful
+// collapse treatment.
+TEST_F(FillerTestWithSubreleaseUnbacked,
+       CheckUnbrokenStateTransitionOnCollapse) {
+  FakePageFlags pageflags;
+  FakeResidency residency;
+  const Length N = kPagesPerHugePage;
+
+  // 1. Allocate a hugepage partially.
+  auto half = AllocateVector(N / 2);
+  ASSERT_EQ(filler_.size(), NHugePages(1));
+  PAlloc pa = half.front();
+
+  // Initially, it should be unbroken.
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+
+  // 2. Subrelease the free pages.
+  EXPECT_EQ(ReleasePages(N / 2), N / 2);
+  // Now it is broken (unbroken_ == false).
+  EXPECT_EQ(filler_.used_pages_in_released(), N / 2);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(0));
+
+  // 3. Allocate the remaining pages (so it becomes fully allocated).
+  auto half2 = AllocateVectorWithSpanAllocInfo(N / 2, pa.span_alloc_info);
+  // It is now fully allocated.
+  // In our new design, it should STILL be marked broken (unbroken_ == false).
+  EXPECT_EQ(filler_.used_pages_in_released(), N);
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(1));
+
+  // Verify it is not yet hugepage backed in stats.
+  std::string buffer = PrintToString(1024 * 1024, [&](Printer& printer) {
+    PageHeapSpinLockHolder l;
+    filler_.Print(printer, true, pageflags);
+  });
+  EXPECT_THAT(buffer,
+              testing::HasSubstr("HugePageFiller: 1 hugepages became full "
+                                 "after being previously released, "
+                                 "out of which 0 pages are hugepage backed."));
+
+  // 4. Trigger a collapse.
+  pageflags.MarkHugePageBacked(pa.p.start_addr(), /*is_hugepage_backed=*/false);
+  Bitmap<kMaxResidencyBits> unbacked, swapped;
+  residency.SetUnbackedAndSwappedBitmaps(pa.p.start_addr(), unbacked, swapped);
+
+  TreatHugepageTrackers(EnableCollapse::kEnabled,
+                        EnableUnfilteredCollapse::kDisabled, &pageflags,
+                        &residency);
+
+  // Verify collapse was tried and succeeded.
+  EXPECT_TRUE(collapse_.TriedCollapse(pa.p.start_addr()));
+  EXPECT_EQ(collapse_.TimesCollapsed(pa.p.start_addr()), 1);
+
+  // In our design, successful collapse should flip unbroken_ to true.
+  // So it should move from regular_alloc_released_ to regular_alloc_.
+  EXPECT_EQ(filler_.used_pages_in_released(), Length(0));
+  EXPECT_EQ(filler_.previously_released_huge_pages(), NHugePages(1));
+
+  // Mark it as hugepage backed in fake pageflags for stats.
+  pageflags.MarkHugePageBacked(pa.p.start_addr(), /*is_hugepage_backed=*/true);
+
+  buffer = PrintToString(1024 * 1024, [&](Printer& printer) {
+    PageHeapSpinLockHolder l;
+    filler_.Print(printer, true, pageflags);
+  });
+  EXPECT_THAT(buffer,
+              testing::HasSubstr("HugePageFiller: 1 hugepages became full "
+                                 "after being previously released, "
+                                 "out of which 1 pages are hugepage backed."));
+
+  // Cleanup.
+  DeleteVector(half);
+  DeleteVector(half2);
 }
 
 TEST_F(FillerTest, AvoidArbitraryQuarantineVMGrowth) {
@@ -4695,7 +5326,7 @@ HugePageFiller: 130 of sparsely-accessed released used native pages are unbacked
   EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_free_unbacked: 126"));
   EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_used_unbacked: 130"));
   EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_free_stale: 0"));
-  EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_used_stale: 1"));
+  EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_used_stale: 2"));
   EXPECT_THAT(buffer_pbtxt, testing::HasSubstr("num_pages_treated: 1"));
   DeleteVector(p1);
   DeleteVector(p2);
@@ -5800,14 +6431,16 @@ TEST_F(FillerTest, StaleHistograms) {
   });
 
   EXPECT_THAT(buffer,
-              testing::HasSubstr("HugePageFiller: # of sparsely-accessed "
-                                 "regular hps with a <= # of stale < b\n"
-                                 "HugePageFiller: <  0<=     0 <  1<=     3"));
+              testing::HasSubstr(
+                  "HugePageFiller: # of sparsely-accessed "
+                  "regular hps with a <= # of stale < b\n"
+                  "HugePageFiller: <  0<=     0 <  1<=     0 <  2<=     3"));
 
-  EXPECT_THAT(buffer, testing::HasSubstr(
-                          "HugePageFiller: # of sparsely-accessed regular hps "
-                          "with a <= # of free AND stale < b\n"
-                          "HugePageFiller: <  0<=     2 <  1<=     1"));
+  EXPECT_THAT(buffer,
+              testing::HasSubstr(
+                  "HugePageFiller: # of sparsely-accessed regular hps "
+                  "with a <= # of free AND stale < b\n"
+                  "HugePageFiller: <  0<=     2 <  1<=     0 <  2<=     1"));
 
   Delete(b);
   Delete(c);
@@ -6190,6 +6823,95 @@ TEST(SkipSubreleaseIntervalsTest, EmptyIsNotEnabled) {
   // When we have a limit hit, we pass SkipSubreleaseIntervals{} to the
   // filler. Make sure it doesn't signal that we should skip the limit.
   EXPECT_FALSE(SkipSubreleaseIntervals{}.SkipSubreleaseEnabled());
+}
+
+TEST(BitmapScaleTest, ScaleAssertionFailures) {
+#ifdef NDEBUG
+  GTEST_SKIP() << "Requires debug mode";
+#endif
+  Bitmap<64> map1;
+  // 1. src_len (64) doesn't divide M (10) and vice versa
+  EXPECT_DEATH(Scale<10>(map1, 64, ReductionOp::kAll), "");
+  // 2. src_len > N (64)
+  EXPECT_DEATH(Scale<256>(map1, 128, ReductionOp::kAll), "");
+}
+
+TEST(BitmapScaleTest, Scale) {
+  // Test case 1: N == M (identity)
+  {
+    Bitmap<64> map1;
+    map1.SetBit(3);
+    map1.SetBit(17);
+    map1.SetBit(63);
+
+    auto map_all = Scale<64>(map1, 64, ReductionOp::kAll);
+    auto map_any = Scale<64>(map1, 64, ReductionOp::kAny);
+    for (size_t i = 0; i < 64; ++i) {
+      EXPECT_EQ(map1.GetBit(i), map_all.GetBit(i));
+      EXPECT_EQ(map1.GetBit(i), map_any.GetBit(i));
+    }
+  }
+
+  // Test case 2: N > M (contracting)
+  {
+    Bitmap<64> map1;
+    // We group by 2 bits.
+    // Group 0: bits 0, 1 -> both must be set
+    map1.SetBit(0);
+    map1.SetBit(1);
+
+    // Group 1: bits 2, 3 -> only one set
+    // Should not be set for kAll, should be set for kAny
+    map1.SetBit(2);
+
+    // Group 7: bits 14, 15 -> both set
+    map1.SetBit(14);
+    map1.SetBit(15);
+
+    auto map_all = Scale<8>(map1, 16, ReductionOp::kAll);
+    auto map_any = Scale<8>(map1, 16, ReductionOp::kAny);
+
+    EXPECT_TRUE(map_all.GetBit(0));
+    EXPECT_TRUE(map_any.GetBit(0));
+
+    EXPECT_FALSE(map_all.GetBit(1));
+    EXPECT_TRUE(map_any.GetBit(1));
+
+    for (size_t i = 2; i <= 6; ++i) {
+      EXPECT_FALSE(map_all.GetBit(i));
+      EXPECT_FALSE(map_any.GetBit(i));
+    }
+
+    EXPECT_TRUE(map_all.GetBit(7));
+    EXPECT_TRUE(map_any.GetBit(7));
+  }
+
+  // Test case 3: N < M (expanding)
+  {
+    Bitmap<64> map1;
+    // We expand by 2 bits.
+    map1.SetBit(0);
+    map1.SetBit(7);
+
+    auto map_all = Scale<16>(map1, 8, ReductionOp::kAll);
+    auto map_any = Scale<16>(map1, 8, ReductionOp::kAny);
+
+    // Both operations behave identically for expanding.
+    EXPECT_TRUE(map_all.GetBit(0));
+    EXPECT_TRUE(map_all.GetBit(1));
+    EXPECT_TRUE(map_any.GetBit(0));
+    EXPECT_TRUE(map_any.GetBit(1));
+
+    EXPECT_FALSE(map_all.GetBit(2));
+    EXPECT_FALSE(map_all.GetBit(3));
+    EXPECT_FALSE(map_any.GetBit(2));
+    EXPECT_FALSE(map_any.GetBit(3));
+
+    EXPECT_TRUE(map_all.GetBit(14));
+    EXPECT_TRUE(map_all.GetBit(15));
+    EXPECT_TRUE(map_any.GetBit(14));
+    EXPECT_TRUE(map_any.GetBit(15));
+  }
 }
 
 }  // namespace

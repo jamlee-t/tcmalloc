@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 
 #include "absl/algorithm/container.h"
 #include "absl/base/attributes.h"
@@ -111,6 +112,7 @@ class StaticForwarder {
                                                         size_t objects_per_span,
                                                         Length pages_per_span)
       ABSL_LOCKS_EXCLUDED(pageheap_lock);
+  static size_t num_objects_to_move(int size_class);
   static void DeallocateSpans(size_t objects_per_span,
                               absl::Span<Span*> free_spans)
       ABSL_LOCKS_EXCLUDED(pageheap_lock);
@@ -140,6 +142,31 @@ static constexpr size_t kSpansUsedStatBuckets =
     absl::bit_width(kMaxObjectsToMove);
 
 enum class LifetimeTracking : bool { kDisabled = false, kEnabled = true };
+
+template <size_t MaxSize, typename RunLength>
+inline int RecordSameSpanRuns(absl::Span<Span* const> batch,
+                              absl::Span<RunLength> run_lengths) {
+  static_assert(MaxSize <= std::numeric_limits<RunLength>::max());
+  TC_ASSERT(!batch.empty());
+  TC_ASSERT_LE(batch.size(), MaxSize);
+  TC_ASSERT_LE(batch.size(), run_lengths.size());
+
+  int matches = 0;
+  int run_start = 0;
+  const Span* last = batch[0];
+  for (int i = 1; i < batch.size(); ++i) {
+    const Span* next = batch[i];
+    if (last == next) {
+      matches++;
+    } else {
+      run_lengths[run_start] = i - run_start;
+      run_start = i;
+      last = next;
+    }
+  }
+  run_lengths[run_start] = batch.size() - run_start;
+  return matches;
+}
 
 // Data kept per size-class in central cache.
 template <typename ForwarderT>
@@ -195,7 +222,9 @@ class CentralFreeList {
   void PrintSpanLifetimeStats(Printer& out);
   void PrintNumSpansUsed(Printer& out);
   void PrintLongLivedSpansMoved(Printer& out);
+  void PrintSameSpanStats(Printer& out);
   void PrintSpanUtilStatsInPbtxt(PbtxtRegion& region);
+  void PrintSameSpanStatsInPbtxt(PbtxtRegion& region);
   void PrintSpanLifetimeStatsInPbtxt(PbtxtRegion& region);
   void PrintNumSpansUsedInPbtxt(PbtxtRegion& region);
   void PrintLongLivedSpansMovedInPbtxt(PbtxtRegion& region);
@@ -221,7 +250,8 @@ class CentralFreeList {
   Span* absl_nullable ReleaseToSpans(absl::Span<T> batch,
                                      Span* absl_nonnull span,
                                      size_t object_size,
-                                     uint32_t size_reciprocal)
+                                     uint32_t size_reciprocal,
+                                     uint32_t objects_per_span)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
   // Populate cache by fetching from the page heap.
@@ -272,7 +302,12 @@ class CentralFreeList {
 
   size_t size_class_;  // My size class (immutable after Init())
   size_t object_size_;
-  size_t objects_per_span_;
+#ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  size_t
+#else
+  uint32_t
+#endif
+      objects_per_span_;
   // Size reciprocal is used to replace division with multiplication when
   // computing object indices in the Span bitmap.
   uint32_t size_reciprocal_ = 0;
@@ -334,6 +369,17 @@ class CentralFreeList {
   // acquiring a lock. Updates to these variables are guarded by lock_
   // so writes are performed using LossyAdd for speed, the lock still
   // guarantees accuracy.
+
+  uint32_t num_to_move_ = 0;
+
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  // Records histogram of how many consecutive objects fell on the same span for
+  // batches.
+  //
+  // Note:  This goes to kMaxObjectsToMove and not kMaxObjectsToMove+1, since we
+  // ignore the very first object.
+  StatsCounter num_same_spans_[kMaxObjectsToMove];
+#endif  // TCMALLOC_INTERNAL_LEGACY_LOCKING
 
   // Num free objects in cache entry
   StatsCounter counter_;
@@ -409,14 +455,24 @@ inline void CentralFreeList<Forwarder>::Init(size_t size_class)
                 std::min<size_t>(absl::bit_width(objects_per_span_), kNumLists);
 
   TC_ASSERT_LE(absl::bit_width(objects_per_span_), kSpanUtilBucketCapacity);
+  num_to_move_ = forwarder_.num_objects_to_move(size_class);
 }
 
 template <class Forwarder>
 template <typename T>
 inline Span* CentralFreeList<Forwarder>::ReleaseToSpans(
     absl::Span<T> batch, Span* span, size_t object_size,
-    uint32_t size_reciprocal) {
-  if (ABSL_PREDICT_FALSE(span->FreelistEmpty(object_size))) {
+    uint32_t size_reciprocal, uint32_t objects_per_span) {
+  constexpr bool kDeferredNonEmpty =
+#ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
+      false
+#else
+      true
+#endif
+      ;
+
+  const bool was_empty = span->FreelistEmpty(object_size, objects_per_span);
+  if (!kDeferredNonEmpty && ABSL_PREDICT_FALSE(was_empty)) {
     const uint8_t index = GetFirstNonEmptyIndex();
     nonempty_.Add(span, index);
     span->set_nonempty_index(index);
@@ -430,7 +486,9 @@ inline Span* CentralFreeList<Forwarder>::ReleaseToSpans(
     // Update the histogram as the span is full and will be removed from the
     // nonempty_ list.
     RecordSpanUtil(prev_bitwidth, /*increase=*/false);
-    nonempty_.Remove(span, prev_index);
+    if (!kDeferredNonEmpty || ABSL_PREDICT_TRUE(!was_empty)) {
+      nonempty_.Remove(span, prev_index);
+    }
     return span;
   }
   // As the objects are being added to the span, its utilization might change.
@@ -448,7 +506,10 @@ inline Span* CentralFreeList<Forwarder>::ReleaseToSpans(
   // by cur_index.
   const uint8_t cur_index =
       IndexFor(span->is_long_lived_span(), cur_allocated, cur_bitwidth);
-  if (cur_index != prev_index) {
+  if (kDeferredNonEmpty && ABSL_PREDICT_FALSE(was_empty)) {
+    nonempty_.Add(span, cur_index);
+    span->set_nonempty_index(cur_index);
+  } else if (cur_index != prev_index) {
     nonempty_.Remove(span, prev_index);
     nonempty_.Add(span, cur_index);
     span->set_nonempty_index(cur_index);
@@ -535,9 +596,29 @@ inline void CentralFreeList<Forwarder>::InsertRange(absl::Span<void*> batch) {
     return;
   }
 
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  using RunLength = uint8_t;
+  RunLength run_lengths[kMaxObjectsToMove] = {0};
+  ABSL_ANNOTATE_MEMORY_IS_UNINITIALIZED(run_lengths, sizeof(run_lengths));
+  static_assert(kMaxObjectsToMove <= std::numeric_limits<RunLength>::max());
+
+  // Record how many objects fell on the same span.
+  //
+  // We only look for consecutive runs of the same span to avoid the cost of
+  // sorting, solely for telemetry purposes.
+  //
+  // TODO(b/175159154): Consider doing this before MapObjectsToSpans based on a
+  // ~(kPageSize - 1u) pointer mask heuristic.
+  const int same_span =
+      central_freelist_internal::RecordSameSpanRuns<kMaxObjectsToMove>(
+          absl::MakeConstSpan(spans, batch.size()),
+          absl::MakeSpan(run_lengths, batch.size()));
+#endif
+
   // Use local copy of variables to ensure that they are not reloaded.
   const size_t object_size = object_size_;
   const uint32_t size_reciprocal = size_reciprocal_;
+  const uint32_t objects_per_span = objects_per_span_;
 #ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
   Span::ObjIdx idx[kMaxObjectsToMove];
   if (Span::UseBitmapForSize(object_size)) {
@@ -559,18 +640,26 @@ inline void CentralFreeList<Forwarder>::InsertRange(absl::Span<void*> batch) {
   // and collect spans that become completely free.
   {
     CentralFreeListLockHolder h(lock_);
-    for (int i = 0; i < batch.size(); ++i) {
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+    num_same_spans_[same_span].LossyAdd(1);
+#endif
+    for (int i = 0; i < batch.size();) {
 #ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
       const absl::Span<void*> b{&batch[i], 1};
+      const size_t step = 1;
 #else
-      const absl::Span<Span::ObjIdx> b{&idx[i], 1};
+      const size_t step = run_lengths[i];
+      TC_ASSERT_GT(step, 0);
+      const absl::Span<Span::ObjIdx> b{&idx[i], step};
 #endif
 
-      Span* span = ReleaseToSpans(b, spans[i], object_size, size_reciprocal);
+      Span* span = ReleaseToSpans(b, spans[i], object_size, size_reciprocal,
+                                  objects_per_span);
       if (ABSL_PREDICT_FALSE(span)) {
         free_spans[free_count] = span;
         free_count++;
       }
+      i += step;
     }
 
     RecordMultiSpansDeallocated(free_count);
@@ -616,6 +705,7 @@ inline int CentralFreeList<Forwarder>::RemoveRange(absl::Span<void*> batch) {
     // Use local copy of variable to ensure that it is not reloaded.
     size_t object_size = object_size_;
     size_t num_spans = 0;
+    size_t objects_per_span = objects_per_span_;
 
     CentralFreeListLockHolder h(lock_);
 
@@ -643,7 +733,7 @@ inline int CentralFreeList<Forwarder>::RemoveRange(absl::Span<void*> batch) {
         RecordSpanUtil(prev_bitwidth, /*increase=*/false);
         RecordSpanUtil(cur_bitwidth, /*increase=*/true);
       }
-      if (span->FreelistEmpty(object_size)) {
+      if (span->FreelistEmpty(object_size, objects_per_span)) {
         nonempty_.Remove(span, prev_index);
       } else {
         // If span allocation changes so that it must be moved to a different
@@ -782,6 +872,35 @@ inline void CentralFreeList<Forwarder>::HandleLongLivedSpans() {
 
   // Track how many spans we moved in each bitwidth bucket.
   long_lived_spans_moved_[absl::bit_width(i)].LossyAdd(1);
+}
+
+template <class Forwarder>
+inline void CentralFreeList<Forwarder>::PrintSameSpanStats(Printer& out) {
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  out.printf("class %3d [ %8zu bytes ] :", size_class_, object_size_);
+  // num_same_spans_ is exclusive with num_to_move_, not inclusive.
+  for (int i = 0; i < num_to_move_; ++i) {
+    out.printf(" %6zu", num_same_spans_[i].value());
+  }
+  out.printf("\n");
+#endif  // TCMALLOC_INTERNAL_LEGACY_LOCKING
+}
+
+template <class Forwarder>
+inline void CentralFreeList<Forwarder>::PrintSameSpanStatsInPbtxt(
+    PbtxtRegion& region) {
+#ifndef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  // num_same_spans_ is exclusive with num_to_move_, not inclusive.
+  for (int i = 0; i < num_to_move_; ++i) {
+    auto value = num_same_spans_[i].value();
+    if (value == 0) {
+      continue;
+    }
+    PbtxtRegion histogram = region.CreateSubRegion("same_span_stats");
+    histogram.PrintI64("lower_bound", i);
+    histogram.PrintI64("value", value);
+  }
+#endif  // TCMALLOC_INTERNAL_LEGACY_LOCKING
 }
 
 template <class Forwarder>

@@ -35,6 +35,7 @@
 #include "tcmalloc/internal/logging.h"
 #include "tcmalloc/internal/memory_tag.h"
 #include "tcmalloc/internal/optimization.h"
+#include "tcmalloc/internal/range_tracker.h"
 #include "tcmalloc/malloc_extension.h"
 
 GOOGLE_MALLOC_SECTION_BEGIN
@@ -208,6 +209,7 @@ inline constexpr size_t kMinObjectsToMove = 2;
 inline constexpr size_t kMaxObjectsToMove = 128;
 
 inline constexpr size_t kPageSize = 1 << kPageShift;
+using PageBitmap = Bitmap<kHugePageSize / kPageSize>;
 
 inline constexpr std::align_val_t kAlignment{8};
 // log2 (kAlignment)
@@ -247,17 +249,6 @@ enum class AllocationAccess {
   kHot,
   kCold,
 };
-
-inline AllocationAccess AccessFromPointer(void* ptr) {
-  if (!kHasExpandedClasses) {
-    TC_ASSERT_NE(GetMemoryTag(ptr), MemoryTag::kCold);
-    return AllocationAccess::kHot;
-  }
-
-  return ABSL_PREDICT_FALSE(GetMemoryTag(ptr) == MemoryTag::kCold)
-             ? AllocationAccess::kCold
-             : AllocationAccess::kHot;
-}
 
 inline MemoryTag MultiNormalTag(size_t partition) {
   switch (partition) {

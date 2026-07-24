@@ -277,6 +277,12 @@ test_variants = [
         "deps": ["//tcmalloc:common_8k_pages"],
         "env": {"BORG_EXPERIMENTS": "TCMALLOC_EAGER_BACKING_V2"},
     },
+    {
+        "name": "tcmalloc_huge_region_adaptive_release",
+        "malloc": "//tcmalloc",
+        "deps": ["//tcmalloc:common_8k_pages"],
+        "env": {"BORG_EXPERIMENTS": "TCMALLOC_HUGE_REGION_ADAPTIVE_RELEASE"},
+    },
 ]
 
 def create_tcmalloc_library(
@@ -399,13 +405,14 @@ def create_tcmalloc_test(
 
 # Create test_suite of name containing tests variants.
 def create_tcmalloc_testsuite(name, srcs, **kwargs):
+    tags = kwargs.get("tags")
     variant_targets = create_tcmalloc_test_variant_targets(
         create_tcmalloc_test,
         name,
         srcs,
         **kwargs
     )
-    native.test_suite(name = name, tests = variant_targets)
+    native.test_suite(name = name, tests = variant_targets, tags = tags)
 
 # Declare a single benchmark binary.
 def create_tcmalloc_benchmark(name, srcs, **kwargs):

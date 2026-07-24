@@ -355,7 +355,7 @@ cc_library(
     hdrs = ["linux_syscall_support.h"],
     copts = TCMALLOC_DEFAULT_COPTS,
     visibility = [
-        "//tcmalloc:friends",
+        "@do_not_use_for_gloop_visibility_only//gloop/base:__subpackages__",
     ],
 )
 
@@ -390,6 +390,7 @@ cc_test(
     copts = TCMALLOC_DEFAULT_COPTS,
     data = [
     ],
+    tags = ["nohwasan"],
     deps = [
         ":logging",
         "@com_google_absl//absl/base:core_headers",
@@ -520,6 +521,7 @@ cc_test(
     deps = [
         ":allocation_guard",
         ":pageflags",
+        ":range_tracker",
         ":strerror",
         ":util",
         "@com_github_google_benchmark//:benchmark",
@@ -886,7 +888,10 @@ cc_test(
     copts = TCMALLOC_DEFAULT_COPTS,
     linkstatic = 1,
     malloc = ":system_malloc",
-    tags = ["noubsan"],
+    tags = [
+        "nohwasan",
+        "noubsan",
+    ],
     deps = [
         ":affinity",
         ":config",
@@ -1009,6 +1014,7 @@ cc_test(
         "@com_google_absl//absl/container:flat_hash_map",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/log:check",
+        "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/time",
@@ -1039,9 +1045,7 @@ cc_library(
     srcs = ["proc_maps.cc"],
     hdrs = ["proc_maps.h"],
     copts = TCMALLOC_DEFAULT_COPTS,
-    visibility = [
-        "//tcmalloc:__subpackages__",
-    ],
+    visibility = ["//tcmalloc:__subpackages__"],
     deps = [
         ":config",
         ":logging",
@@ -1284,6 +1288,7 @@ cc_test(
     srcs = ["system_allocator_mlockall_test.cc"],
     copts = TCMALLOC_DEFAULT_COPTS,
     tags = [
+        "nohwasan",
         "nomsan",
         "notsan",
     ],
@@ -1305,7 +1310,8 @@ cc_library(
     visibility = [
         "//tcmalloc:__pkg__",
         "//tcmalloc:__subpackages__",
-        "//tcmalloc:friends",
+        "@do_not_use_for_gloop_visibility_only//gloop/base:__subpackages__",
+        "@do_not_use_for_gloop_visibility_only//gloop/concurrent/rcu:__subpackages__",
     ],
     deps = [
         ":config",
@@ -1326,6 +1332,7 @@ cc_test(
     deps = [
         ":cpu_utils",
         ":sysinfo",
+        "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:string_view",
         "@com_google_fuzztest//fuzztest",
         "@com_google_fuzztest//fuzztest:fuzztest_gtest_main",

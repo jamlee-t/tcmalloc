@@ -37,9 +37,11 @@
 #include "absl/base/thread_annotations.h"
 #include "absl/container/fixed_array.h"
 #include "absl/container/flat_hash_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/memory/memory.h"
 #include "absl/numeric/bits.h"
 #include "absl/random/random.h"
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_join.h"
 #include "absl/synchronization/mutex.h"
@@ -328,6 +330,54 @@ TEST_P(StaticForwarderTest, Fuzz) {
   EXPECT_LE(static_cast<int64_t>(page_heap_after.system_bytes) -
                 static_cast<int64_t>(page_heap_before.system_bytes),
             bytes_allocated / 2);
+}
+
+TEST(CentralFreeListHelperTest, RecordSameSpanRuns) {
+  Span s1, s2, s3;
+
+  struct TestCase {
+    std::string name;
+    std::vector<Span*> batch;
+    int expected_matches;
+    std::vector<uint8_t> expected_run_lengths;
+  };
+
+  std::vector<TestCase> test_cases = {
+      {
+          .name = "SingleElement",
+          .batch = {&s1},
+          .expected_matches = 0,
+          .expected_run_lengths = {1},
+      },
+      {
+          .name = "AllSame",
+          .batch = {&s1, &s1, &s1},
+          .expected_matches = 2,
+          .expected_run_lengths = {3, 0, 0},
+      },
+      {
+          .name = "AllDifferent",
+          .batch = {&s1, &s2, &s3},
+          .expected_matches = 0,
+          .expected_run_lengths = {1, 1, 1},
+      },
+      {
+          .name = "MixedRuns",
+          .batch = {&s1, &s1, &s2, &s1, &s1, &s1},
+          .expected_matches = 3,
+          .expected_run_lengths = {2, 0, 1, 3, 0, 0},
+      },
+  };
+
+  for (const auto& tc : test_cases) {
+    SCOPED_TRACE(tc.name);
+    std::vector<uint8_t> run_lengths(tc.batch.size(), 0);
+    int matches = RecordSameSpanRuns<kMaxObjectsToMove>(
+        absl::MakeConstSpan(tc.batch), absl::MakeSpan(run_lengths));
+    EXPECT_EQ(matches, tc.expected_matches);
+    EXPECT_THAT(run_lengths,
+                testing::ElementsAreArray(tc.expected_run_lengths));
+  }
 }
 
 INSTANTIATE_TEST_SUITE_P(All, StaticForwarderTest,
@@ -961,6 +1011,61 @@ TEST_P(CentralFreeListTest, SpanAllocationTracker) {
                                  single_spans))));
 }
 
+TEST_P(CentralFreeListTest, SameSpans) {
+#ifdef TCMALLOC_INTERNAL_LEGACY_LOCKING
+  GTEST_SKIP() << "Stats are non-functional when optimization is not enabled.";
+#endif
+  const int num_to_move = GetParam().num_to_move;
+  TypeParam e(GetParam().size, GetParam().bytes, num_to_move);
+
+  // Roundtrip a batch.
+  void* batch[kMaxObjectsToMove];
+  const int got =
+      e.central_freelist().RemoveRange(absl::MakeSpan(batch, num_to_move));
+  ASSERT_GT(got, 0);
+
+  Span* spans[kMaxObjectsToMove];
+  e.forwarder().MapObjectsToSpans(absl::MakeSpan(batch, got), spans,
+                                  e.kSizeClass);
+  absl::flat_hash_set<Span*> pseudo_spans;
+  for (int i = 0; i < got; ++i) {
+    pseudo_spans.insert(spans[i]);
+  }
+
+  e.central_freelist().InsertRange(absl::MakeSpan(batch, got));
+
+  // Check the stats after the first insertion.
+  {
+    std::string expected_stats = absl::StrFormat(
+        "class %3d [ %8zu bytes ] :", e.kSizeClass, GetParam().size);
+    for (int i = 0; i < num_to_move; ++i) {
+      const bool first_batch =
+          e.objects_per_span() > 1 && i == got - pseudo_spans.size();
+      const int count = first_batch ? 1 : 0;
+      absl::StrAppendFormat(&expected_stats, " %6d", count);
+    }
+    absl::StrAppend(&expected_stats, "\n");
+
+    std::string buffer = PrintToString(1024 * 1024, [&](Printer& printer) {
+      e.central_freelist().PrintSameSpanStats(printer);
+    });
+    EXPECT_EQ(buffer, expected_stats) << got;
+  }
+  {
+    std::string expected_pbtxt =
+        e.objects_per_span() > 1
+            ? absl::StrFormat(" same_span_stats { lower_bound: %d value: 1}",
+                              got - pseudo_spans.size())
+            : "";
+
+    std::string buffer_pbtxt =
+        PrintToString(1024 * 1024, [&](PbtxtRegion& region) {
+          e.central_freelist().PrintSameSpanStatsInPbtxt(region);
+        });
+    EXPECT_EQ(buffer_pbtxt, expected_pbtxt) << got;
+  }
+}
+
 TEST_P(CentralFreeListTest, MultipleSpans) {
 #if ABSL_HAVE_HWADDRESS_SANITIZER
   GTEST_SKIP()
@@ -1074,47 +1179,6 @@ TEST_P(CentralFreeListTest, PassSpanDensityToPageheap) {
   };
   test_function(1, AccessDensityPrediction::kDense);
   test_function(e.objects_per_span(), AccessDensityPrediction::kDense);
-}
-
-TEST_P(CentralFreeListTest, SpanFragmentation) {
-#if ABSL_HAVE_HWADDRESS_SANITIZER
-  GTEST_SKIP()
-      << "Skipping under HWASan, which uses the top bits of the pointer.";
-#endif
-
-  // This test is primarily exercising Span itself to model how tcmalloc.cc uses
-  // it, but this gives us a self-contained (and sanitizable) implementation of
-  // the CentralFreeList.
-  TypeParam e(GetParam().size, GetParam().bytes, GetParam().num_to_move);
-  // Allocate one object from the CFL to allocate a span.
-  void* initial;
-  int got = e.central_freelist().RemoveRange(absl::MakeSpan(&initial, 1));
-  ASSERT_EQ(got, 1);
-
-  Span* const span = e.central_freelist().forwarder().MapObjectToSpan(initial);
-  const size_t object_size =
-      e.central_freelist().forwarder().class_to_size(TypeParam::kSizeClass);
-
-  ThreadManager fragmentation;
-  fragmentation.Start(1, [&](int) {
-    if (e.objects_per_span() != 1) {
-      benchmark::DoNotOptimize(span->Fragmentation(object_size));
-    }
-  });
-
-  ThreadManager cfl;
-  cfl.Start(1, [&](int) {
-    void* next;
-    int got = e.central_freelist().RemoveRange(absl::MakeSpan(&next, 1));
-    e.central_freelist().InsertRange(absl::MakeSpan(&next, got));
-  });
-
-  absl::SleepFor(absl::Milliseconds(50));
-
-  fragmentation.Stop();
-  cfl.Stop();
-
-  e.central_freelist().InsertRange(absl::MakeSpan(&initial, 1));
 }
 
 TEST_P(CentralFreeListTest, SpanLifetimeWithLongLivedSpans) {

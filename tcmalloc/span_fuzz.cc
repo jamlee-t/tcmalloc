@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <random>
 #include <type_traits>
@@ -29,7 +30,9 @@
 #include "fuzztest/fuzztest.h"
 #include "absl/types/span.h"
 #include "tcmalloc/common.h"
+#include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/logging.h"
+#include "tcmalloc/internal/sampled_allocation.h"
 #include "tcmalloc/pages.h"
 #include "tcmalloc/sizemap.h"
 #include "tcmalloc/span.h"
@@ -40,6 +43,16 @@ namespace {
 
 auto AnyLength() {
   return fuzztest::ConstructorOf<Length>(fuzztest::Arbitrary<size_t>());
+}
+
+auto AnyPositiveLength() {
+  return fuzztest::ConstructorOf<Length>(
+      fuzztest::InRange<size_t>(1, std::numeric_limits<size_t>::max()));
+}
+
+auto AnyPageId() {
+  return fuzztest::ConstructorOf<PageId>(fuzztest::InRange<size_t>(
+      1, (size_t{1} << (kAddressBits - kPageShift)) - 1));
 }
 
 struct Alloc {
@@ -92,8 +105,6 @@ using Instruction = std::variant<Alloc, Shuffle, Dealloc, DeallocIndex>;
 void FuzzSpanInstructions(size_t object_size_direct, Length num_pages_direct,
                           uint8_t num_objects_to_move,
                           std::vector<Instruction> instructions) {
-  GTEST_SKIP() << "Skipping";
-
 #if ABSL_HAVE_HWADDRESS_SANITIZER
   GTEST_SKIP()
       << "Skipping under HWASan, which uses the top bits of the pointer.";
@@ -143,7 +154,7 @@ void FuzzSpanInstructions(size_t object_size_direct, Length num_pages_direct,
           using T = std::decay_t<decltype(arg)>;
           if constexpr (std::is_same_v<T, Alloc>) {
             size_t n = std::min<size_t>(arg.count, num_to_move);
-            if (span->FreelistEmpty(object_size)) {
+            if (span->FreelistEmpty(object_size, objects_per_span)) {
               n = 0;
             }
             if (n == 0) {
@@ -262,7 +273,7 @@ void FuzzSpan(size_t object_size, Length num_pages, size_t num_to_move,
     size_t want = std::min(num_to_move, objects_per_span - ptrs.size());
     TC_CHECK_GT(want, 0);
     void* batch[kMaxObjectsToMove];
-    TC_CHECK(!span->FreelistEmpty(object_size));
+    TC_CHECK(!span->FreelistEmpty(object_size, objects_per_span));
     size_t n = span->FreelistPopBatch(absl::MakeSpan(batch, want), object_size);
 
     TC_CHECK_GT(n, 0);
@@ -271,7 +282,7 @@ void FuzzSpan(size_t object_size, Length num_pages, size_t num_to_move,
     ptrs.insert(ptrs.end(), batch, batch + n);
   }
 
-  TC_CHECK(span->FreelistEmpty(object_size));
+  TC_CHECK(span->FreelistEmpty(object_size, objects_per_span));
   TC_CHECK_EQ(ptrs.size(), objects_per_span);
   TC_CHECK_EQ(ptrs.size(), span->Allocated());
 
@@ -283,7 +294,8 @@ void FuzzSpan(size_t object_size, Length num_pages, size_t num_to_move,
     // element onto the freelist.
     //
     // For single object spans, the freelist always stays "empty" as a result.
-    TC_CHECK(popped == 1 || !span->FreelistEmpty(object_size));
+    TC_CHECK(popped == 1 ||
+             !span->FreelistEmpty(object_size, objects_per_span));
   }
 
   // We bitpack alloc time and do not store the full value.  We are willing to
@@ -336,6 +348,56 @@ FUZZ_TEST(SpanTest, FuzzSpan)
     .WithDomains(fuzztest::InRange<size_t>(0, kMaxSize), AnyLength(),
                  fuzztest::Arbitrary<size_t>(), fuzztest::Arbitrary<size_t>(),
                  fuzztest::Arbitrary<uint64_t>());
+
+void FuzzSpanSampling(PageId start, Length num_pages) {
+  if (num_pages.raw_num() >=
+      std::numeric_limits<size_t>::max() - start.index()) {
+    GTEST_SKIP() << "Skipping overflow range";
+  }
+
+  // FuzzSpanSampling is a property-based test to ensure sampling does not
+  // impact other parts of the span state.
+  Span span(Range(start, num_pages));
+
+  EXPECT_EQ(span.first_page(), start);
+  EXPECT_EQ(span.num_pages(), num_pages);
+  EXPECT_EQ(span.last_page() + Length(1), start + num_pages);
+  EXPECT_FALSE(span.sampled());
+
+  SampledAllocation alloc;
+
+  span.Sample(&alloc);
+
+  EXPECT_EQ(span.first_page(), start);
+  EXPECT_EQ(span.num_pages(), num_pages);
+  EXPECT_EQ(span.last_page() + Length(1), start + num_pages);
+  EXPECT_TRUE(span.sampled());
+
+  SampledAllocation* ptr = span.Unsample();
+
+  EXPECT_EQ(ptr, &alloc);
+  EXPECT_EQ(span.first_page(), start);
+  EXPECT_EQ(span.num_pages(), num_pages);
+  EXPECT_EQ(span.last_page() + Length(1), start + num_pages);
+  EXPECT_FALSE(span.sampled());
+
+  // Unsampling again should not produce the pointer again.
+  ptr = span.Unsample();
+
+  EXPECT_EQ(ptr, nullptr);
+  EXPECT_EQ(span.first_page(), start);
+  EXPECT_EQ(span.num_pages(), num_pages);
+  EXPECT_EQ(span.last_page() + Length(1), start + num_pages);
+  EXPECT_FALSE(span.sampled());
+}
+
+FUZZ_TEST(SpanTest, FuzzSpanSampling)
+    .WithDomains(AnyPageId(), AnyPositiveLength());
+
+TEST(SpanTest, FuzzSpanSamplingRegression) {
+  FuzzSpanSampling(PageId(34359738367), Length(1));
+  FuzzSpanSampling(PageId(1), Length(18446744073709551614ull));
+}
 
 }  // namespace
 }  // namespace tcmalloc::tcmalloc_internal

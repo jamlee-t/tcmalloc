@@ -72,6 +72,9 @@ class StaticForwarder {
     return Parameters::release_partial_alloc_pages();
   }
 
+  static SubreleaseUnbackedMode subrelease_unbacked_hugepages() {
+    return Parameters::subrelease_unbacked_hugepages();
+  }
 
   static bool hpaa_subrelease() { return Parameters::hpaa_subrelease(); }
 
@@ -81,6 +84,10 @@ class StaticForwarder {
 
   static bool huge_region_adaptive_release() {
     return Parameters::huge_region_adaptive_release();
+  }
+
+  static bool release_max_cold_pages() {
+    return Parameters::release_max_cold_pages();
   }
 
   // Arena state.
@@ -490,7 +497,7 @@ inline HugePageAwareAllocator<Forwarder>::HugePageAwareAllocator(
       collapse_(*this),
       set_anon_vma_name_(*this),
       filler_(tag_, unback_, unback_without_lock_, collapse_,
-              set_anon_vma_name_),
+              set_anon_vma_name_, forwarder_.subrelease_unbacked_hugepages()),
       regions_(options.use_huge_region_more_often),
       tracker_allocator_(forwarder_.arena()),
       region_allocator_(forwarder_.arena()),
@@ -1031,9 +1038,12 @@ inline Length HugePageAwareAllocator<Forwarder>::ReleaseAtLeastNPages(
   // THP coverage. It is however very useful to have the ability to turn this on
   // for testing.
   if (hpaa_subrelease()) {
-    if (released < num_pages) {
+    const bool release_max_cold =
+        tag_ == MemoryTag::kCold && forwarder_.release_max_cold_pages();
+    if (released < num_pages || release_max_cold) {
+      Length desired = release_max_cold ? Length::max() : num_pages - released;
       released += filler_.ReleasePages(
-          num_pages - released,
+          desired,
           SkipSubreleaseIntervals{
               .short_interval =
                   forwarder_.filler_skip_subrelease_short_interval(),

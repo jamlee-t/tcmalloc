@@ -151,7 +151,8 @@ enum class ProfileType {
   kHeap,
 
   // Fragmentation report
-  kFragmentation,
+  kFragmentation ABSL_DEPRECATED(
+      "Fragmentation profiles are no longer collected"),
 
   // Sample of objects that were live at a recent peak of total heap usage. The
   // specifics of when exactly this profile is collected are subject to change.
@@ -633,7 +634,7 @@ class MallocExtension final {
   //  tcmalloc.metadata_bytes      -- Used by internal data structures
   //  tcmalloc.thread_cache_count  -- Number of thread caches in use
   //  tcmalloc.experiment.NAME     -- Experiment NAME is running if 1
-  using PropertyMap = std::map<std::string, Property>;
+  using PropertyMap = std::map<std::string, Property, std::less<>>;
   [[nodiscard]] static PropertyMap GetProperties();
 
   [[nodiscard]] static Profile SnapshotCurrent(tcmalloc::ProfileType type);

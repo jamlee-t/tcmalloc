@@ -33,6 +33,7 @@
 #include "tcmalloc/experiment_config.h"
 #include "tcmalloc/guarded_page_allocator.h"
 #include "tcmalloc/huge_page_filler.h"
+#include "tcmalloc/huge_pages.h"
 #include "tcmalloc/internal/config.h"
 #include "tcmalloc/internal/cpu_utils.h"
 #include "tcmalloc/internal/logging.h"
@@ -534,6 +535,13 @@ void DumpStats(Printer& out, int level) {
       tc_globals.central_freelist(size_class).PrintLongLivedSpansMoved(out);
     }
 
+    out.printf("------------------------------------------------\n");
+    out.printf("Central cache freelist: Same-span returns\n");
+    out.printf("------------------------------------------------\n");
+    for (int size_class = 1; size_class < kNumClasses; ++size_class) {
+      tc_globals.central_freelist(size_class).PrintSameSpanStats(out);
+    }
+
     tc_globals.transfer_cache().Print(tc_globals.per_size_class_counts(), out);
     tc_globals.sharded_transfer_cache().Print(
         tc_globals.per_size_class_counts(), out);
@@ -626,6 +634,8 @@ void DumpStats(Printer& out, int level) {
                Parameters::release_partial_alloc_pages() ? 1 : 0);
     out.printf("PARAMETER tcmalloc_release_pages_from_huge_region %d\n",
                Parameters::release_pages_from_huge_region() ? 1 : 0);
+    out.printf("PARAMETER tcmalloc_huge_region_adaptive_release %d\n",
+               Parameters::huge_region_adaptive_release() ? 1 : 0);
     out.printf("PARAMETER tcmalloc_use_wider_slabs %d\n",
                tc_globals.cpu_cache().UseWiderSlabs() ? 1 : 0);
     out.printf("PARAMETER heap_partitioning %d\n",
@@ -648,6 +658,11 @@ void DumpStats(Printer& out, int level) {
         Parameters::usermode_hugepage_collapse() == EnableCollapse::kEnabled
             ? 1
             : 0);
+    out.printf("PARAMETER tcmalloc_subrelease_unbacked_hugepages %d\n",
+               Parameters::subrelease_unbacked_hugepages() ==
+                       SubreleaseUnbackedMode::kEnabled
+                   ? 1
+                   : 0);
 
     out.printf("PARAMETER tcmalloc_back_small_allocations %d\n",
                Parameters::back_small_allocations() ? 1 : 0);
@@ -809,6 +824,7 @@ void DumpStatsInPbtxt(Printer& out, int level) {
       tc_globals.central_freelist(size_class).PrintNumSpansUsedInPbtxt(entry);
       tc_globals.central_freelist(size_class)
           .PrintLongLivedSpansMovedInPbtxt(entry);
+      tc_globals.central_freelist(size_class).PrintSameSpanStatsInPbtxt(entry);
     }
 
     tc_globals.transfer_cache().PrintInPbtxt(tc_globals.per_size_class_counts(),
@@ -894,6 +910,8 @@ void DumpStatsInPbtxt(Printer& out, int level) {
                    Parameters::release_partial_alloc_pages());
   region.PrintBool("tcmalloc_release_pages_from_huge_region",
                    Parameters::release_pages_from_huge_region());
+  region.PrintBool("tcmalloc_huge_region_adaptive_release",
+                   Parameters::huge_region_adaptive_release());
   region.PrintI64("profile_sampling_interval",
                   Parameters::profile_sampling_interval());
   region.PrintRaw("percpu_vcpu_type",
@@ -908,6 +926,9 @@ void DumpStatsInPbtxt(Printer& out, int level) {
   region.PrintBool(
       "usermode_hugepage_collapse",
       Parameters::usermode_hugepage_collapse() == EnableCollapse::kEnabled);
+  region.PrintBool("subrelease_unbacked_hugepages",
+                   Parameters::subrelease_unbacked_hugepages() ==
+                       SubreleaseUnbackedMode::kEnabled);
 
   region.PrintBool("back_small_allocations",
                    Parameters::back_small_allocations());

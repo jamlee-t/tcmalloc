@@ -66,7 +66,7 @@ ResidencyPageMap::ResidencyPageMap()
     : fd_(signal_safe_open("/proc/self/pagemap", O_RDONLY)) {
   TC_CHECK_GE(sizeof(buf_), kSizeOfHugepageInPagemap,
               "Buffer size is not large enough to hold the pagemap entries");
-  TC_CHECK_LE(kNativePagesInHugePage, kMaxResidencyBits,
+  TC_CHECK_LE(kHardwarePagesInHugePage, kMaxResidencyBits,
               "Actual number of native pages in a hugepage is larger than the "
               "total capacity of residency bitmaps");
 }
@@ -75,7 +75,7 @@ ResidencyPageMap::ResidencyPageMap(const char* const alternate_filename)
     : fd_(signal_safe_open(alternate_filename, O_RDONLY)) {
   TC_CHECK_GE(sizeof(buf_), kSizeOfHugepageInPagemap,
               "Buffer size is not large enough to hold the pagemap entries");
-  TC_CHECK_LE(kNativePagesInHugePage, kMaxResidencyBits,
+  TC_CHECK_LE(kHardwarePagesInHugePage, kMaxResidencyBits,
               "Actual number of native pages in a hugepage is larger than the "
               "total capacity of residency bitmaps");
 }
@@ -87,7 +87,7 @@ ResidencyPageMap::~ResidencyPageMap() {
 }
 
 absl::StatusCode ResidencyPageMap::Seek(const uintptr_t vaddr) {
-  size_t offset = vaddr / kPageSize * kPagemapEntrySize;
+  size_t offset = vaddr / kHardwarePageSize * kPagemapEntrySize;
   // Note: lseek can't be interrupted.
   off_t status = ::lseek(fd_, offset, SEEK_SET);
   if (status != offset) {
@@ -124,7 +124,7 @@ absl::StatusCode ResidencyPageMap::ReadMany(int64_t num_pages,
       return absl::StatusCode::kUnavailable;
     }
     for (int i = 0; i < batch_size; ++i) {
-      Update(buf_[i], kPageSize, info);
+      Update(buf_[i], kHardwarePageSize, info);
     }
     num_pages -= batch_size;
   }
@@ -142,12 +142,13 @@ std::optional<Residency::Info> ResidencyPageMap::Get(const void* const addr,
 
   uintptr_t uaddr = reinterpret_cast<uintptr_t>(addr);
   // Round address down to get the start of the page containing the data.
-  uintptr_t basePage = uaddr & ~(kPageSize - 1);
+  uintptr_t basePage = uaddr & ~(kHardwarePageSize - 1);
   // Round end address up to get the end of the page containing the data.
   // The data is in [basePage, endPage).
-  uintptr_t endPage = (uaddr + size + kPageSize - 1) & ~(kPageSize - 1);
+  uintptr_t endPage =
+      (uaddr + size + kHardwarePageSize - 1) & ~(kHardwarePageSize - 1);
 
-  int64_t remainingPages = (endPage - basePage) / kPageSize;
+  int64_t remainingPages = (endPage - basePage) / kHardwarePageSize;
 
   if (auto res = Seek(basePage); res != absl::StatusCode::kOk) {
     return std::nullopt;
@@ -168,7 +169,7 @@ std::optional<Residency::Info> ResidencyPageMap::Get(const void* const addr,
   if (!res.has_value()) return std::nullopt;
 
   // Handle the first page.
-  size_t firstPageSize = kPageSize - (uaddr - basePage);
+  size_t firstPageSize = kHardwarePageSize - (uaddr - basePage);
   Update(res.value(), firstPageSize, info);
   remainingPages--;
 
@@ -179,7 +180,7 @@ std::optional<Residency::Info> ResidencyPageMap::Get(const void* const addr,
   }
 
   // Check final page
-  size_t lastPageSize = kPageSize - (endPage - uaddr - size);
+  size_t lastPageSize = kHardwarePageSize - (endPage - uaddr - size);
   res = ReadOne();
   if (!res.has_value()) return std::nullopt;
   Update(res.value(), lastPageSize, info);
@@ -212,7 +213,7 @@ Residency::SinglePageBitmaps ResidencyPageMap::GetUnbackedAndSwappedBitmaps(
                              absl::StatusCode::kUnavailable};
   }
 
-  for (int native_page_idx = 0; native_page_idx < kNativePagesInHugePage;
+  for (int native_page_idx = 0; native_page_idx < kHardwarePagesInHugePage;
        ++native_page_idx) {
     uint64_t page_map = buf_[native_page_idx];
     if (!PagePresent(page_map)) {

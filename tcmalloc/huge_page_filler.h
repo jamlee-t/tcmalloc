@@ -72,6 +72,41 @@ enum class HugePageTreatmentType : uint8_t {
   kCollapse = 1 << 1,
 };
 
+// Reduction operations for Scale(). In the case of contracting bitmaps,
+// we need to reduce multiple (n) bits to a single bit.
+//
+// - kAny: If any of the n bits are set, the resulting bit is set.
+// - kAll: If all of the n bits are set, the resulting bit is set.
+enum class ReductionOp {
+  kAny,
+  kAll,
+};
+
+// Scales `src` bitmap from `src_len` bits to `M` bits. If it's a contraction,
+// applies `op` to reduce multiple bits to one. If it's an expansion (or
+// identity), `op` is a no-op.
+template <size_t M, size_t N>
+Bitmap<M> Scale(const Bitmap<N>& src, size_t src_len, ReductionOp op) {
+  TC_ASSERT_LE(src_len, N);
+  TC_ASSERT(src_len % M == 0 || M % src_len == 0);
+
+  Bitmap<M> res;
+  const size_t src_per_dst = std::max<size_t>(1, src_len / M);
+  const size_t dst_per_src = std::max<size_t>(1, M / src_len);
+
+  const size_t required_count = (op == ReductionOp::kAll) ? src_per_dst : 1;
+
+  size_t dst_idx = 0;
+  for (size_t src_idx = 0; src_idx < src_len; src_idx += src_per_dst) {
+    size_t count = src.CountBits(src_idx, src_per_dst);
+    if (count >= required_count) {
+      res.SetRange(dst_idx, dst_per_src);
+    }
+    dst_idx += dst_per_src;
+  }
+  return res;
+}
+
 // PageTracker keeps track of the allocation status of every page in a HugePage.
 // It allows allocation and deallocation of a contiguous run of pages.
 //
@@ -208,6 +243,7 @@ class PageTracker : public TList<PageTracker>::Elem {
   // RecordFeatures().
   TrackerFeatures features() const { return features_; }
   bool unbroken() const { return unbroken_; }
+  void set_unbroken(bool status) { unbroken_ = status; }
 
   // Returns the hugepage whose availability is being tracked.
   HugePage location() const { return location_; }
@@ -216,6 +252,13 @@ class PageTracker : public TList<PageTracker>::Elem {
   // Returns the count of pages unbacked.
   Length ReleaseFree(MemoryModifyFunction& unback)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+
+  Length MarkSubreleased(PageBitmap unbacked)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+
+  Bitmap<kPagesPerHugePage.raw_num()> released_by_page() const {
+    return released_by_page_;
+  }
 
   // Attempts to collapse memory tracked by this tracker. Returns true if the
   // collapse was successful.
@@ -239,9 +282,15 @@ class PageTracker : public TList<PageTracker>::Elem {
     // This records the trackers that are currently being collapsed. This is
     // used to avoid subreleasing the pages that are being collapsed.
     bool being_collapsed = false;
-    // Records swap and unbacked bitmaps for this hugepage.
-    Residency::SinglePageBitmaps bitmaps;
-    ResidencyBitmap stale;
+    // Records the unbacked bitmap for this hugepage. In terms of TCMalloc
+    // pages. scaled via `ReductionOp::kAll`.
+    PageBitmap unbacked;
+    // Records the swapped bitmap for this hugepage. In terms of TCMalloc
+    // pages. scaled via `ReductionOp::kAny`.
+    PageBitmap swapped;
+    // Records the stale bitmap for this hugepage. In terms of TCMalloc
+    // pages. scaled via `ReductionOp::kAny`.
+    PageBitmap stale;
     // Records whether collapse was skipped due to threshold constraints.
     bool collapse_skipped = false;
     // Records whether collapse was skipped due to backoff.
@@ -308,7 +357,7 @@ class PageTracker : public TList<PageTracker>::Elem {
   void SetAnonVmaName(MemoryTagFunction& set_anon_vma_name,
                       std::optional<absl::string_view> name);
 
-  struct NativePageResidencyInfo {
+  struct HardwarePageResidencyInfo {
     size_t n_free_swapped;
     size_t n_used_swapped;
     size_t n_free_unbacked;
@@ -317,8 +366,9 @@ class PageTracker : public TList<PageTracker>::Elem {
     size_t n_used_stale;
   };
 
-  NativePageResidencyInfo CountInfoInHugePage(
-      Residency::SinglePageBitmaps bitmaps, ResidencyBitmap stale) const;
+  HardwarePageResidencyInfo CountInfoInHugePage(PageBitmap unbacked,
+                                                PageBitmap swapped,
+                                                PageBitmap stale) const;
 
  private:
   HugePage location_;
@@ -421,6 +471,7 @@ struct HugePageTreatmentStats {
   std::array<size_t, static_cast<size_t>(CollapseErrorType::kErrorTypes)>
       collapse_errors = {0};
   size_t treated_pages_subreleased = 0;
+  size_t treated_pages_unbacked_subreleased = 0;
 
   // TODO(287498389): Add latency histogram once we have a better idea of the
   // range of values.
@@ -535,26 +586,26 @@ class UsageInfo {
     }
 
     // Native page Histograms bounds
-    const size_t kNativePagesInHugePage = kHugePageSize / GetPageSize();
-    const int kStep = kNativePagesInHugePage / kBucketsInBetween;
+    const size_t kHardwarePagesInHugePage = kHugePageSize / GetPageSize();
+    const int kStep = kHardwarePagesInHugePage / kBucketsInBetween;
     // Ensure that the number of native page buckets is at least the number of
     // buckets at a bound.
-    TC_ASSERT_GE(kNativePagesInHugePage, kBucketsAtBounds);
+    TC_ASSERT_GE(kHardwarePagesInHugePage, kBucketsAtBounds);
     // First kBucketsAtBounds buckets have a step size of 1
     for (int i = 0; i <= kBucketsAtBounds &&
-                    native_page_buckets_size_ < kNativePagesInHugePage;
+                    native_page_buckets_size_ < kHardwarePagesInHugePage;
          ++i) {
       native_page_bucket_bounds_[native_page_buckets_size_] = i;
       ++native_page_buckets_size_;
     }
 
     // All the buckets in between should increment with a step of
-    // kNativePagesInHugePage / kBucketsInBetween
-    for (int i = 0; i < kNativePagesInHugePage - kBucketsAtBounds; ++i) {
+    // kHardwarePagesInHugePage / kBucketsInBetween
+    for (int i = 0; i < kHardwarePagesInHugePage - kBucketsAtBounds; ++i) {
       int bound =
           native_page_bucket_bounds_[native_page_buckets_size_ - 1] + kStep;
       // We break early so that we can log histogram at the end with step 1
-      if (bound >= kNativePagesInHugePage - kBucketsAtBounds) {
+      if (bound >= kHardwarePagesInHugePage - kBucketsAtBounds) {
         break;
       }
       native_page_bucket_bounds_[native_page_buckets_size_] = bound;
@@ -563,7 +614,7 @@ class UsageInfo {
 
     // End kBucketBoundsBuckets have a step size of 1
     for (int i = 0; i < kBucketsAtBounds; ++i) {
-      int end_bound = kNativePagesInHugePage - kBucketsAtBounds + i;
+      int end_bound = kHardwarePagesInHugePage - kBucketsAtBounds + i;
       // Prevent duplicate end bounds from being added to the histogram
       if (native_page_bucket_bounds_[native_page_buckets_size_ - 1] >=
           end_bound) {
@@ -692,20 +743,23 @@ class UsageInfo {
       } else {
         records.num_free_non_hugepage_backed += (free - pt.released_pages());
         records.num_used_non_hugepage_backed += pt.used_pages();
-        Residency::SinglePageBitmaps bitmaps = hugepage_residency_state.bitmaps;
-        ++records.unbacked_histo[NativePageBucketNum(
-            bitmaps.unbacked.CountBits())];
-        ++records
-              .swapped_histo[NativePageBucketNum(bitmaps.swapped.CountBits())];
-        ++records.stale_histo[NativePageBucketNum(
-            hugepage_residency_state.stale.CountBits())];
+        PageTracker::HardwarePageResidencyInfo info = pt.CountInfoInHugePage(
+            hugepage_residency_state.unbacked, hugepage_residency_state.swapped,
+            hugepage_residency_state.stale);
 
-        PageTracker::NativePageResidencyInfo info =
-            pt.CountInfoInHugePage(bitmaps, hugepage_residency_state.stale);
+        auto unbacked_bits = info.n_used_unbacked + info.n_free_unbacked;
+        auto swapped_bits = info.n_used_swapped + info.n_free_swapped;
+        auto stale_bits = info.n_used_stale + info.n_free_stale;
+
+        ++records.unbacked_histo[HardwarePageBucketNum(unbacked_bits)];
+        ++records.swapped_histo[HardwarePageBucketNum(swapped_bits)];
+        ++records.stale_histo[HardwarePageBucketNum(stale_bits)];
+
         ++records
-              .free_unbacked_histo[NativePageBucketNum(info.n_free_unbacked)];
-        ++records.free_swapped_histo[NativePageBucketNum(info.n_free_swapped)];
-        ++records.free_stale_histo[NativePageBucketNum(info.n_free_stale)];
+              .free_unbacked_histo[HardwarePageBucketNum(info.n_free_unbacked)];
+        ++records
+              .free_swapped_histo[HardwarePageBucketNum(info.n_free_swapped)];
+        ++records.free_stale_histo[HardwarePageBucketNum(info.n_free_stale)];
         records.num_free_swapped += Length(info.n_free_swapped);
         records.num_used_swapped += Length(info.n_used_swapped);
         records.num_free_unbacked += Length(info.n_free_unbacked);
@@ -761,18 +815,18 @@ class UsageInfo {
     PrintHisto(out, records.long_lived_hps_histo, type,
                "hps with a <= # of allocations < b", 0);
 
-    PrintNativePageHisto(out, records.unbacked_histo, type,
-                         "hps with a <= # of unbacked < b", 0);
-    PrintNativePageHisto(out, records.swapped_histo, type,
-                         "hps with a <= # of swapped < b", 0);
-    PrintNativePageHisto(out, records.stale_histo, type,
-                         "hps with a <= # of stale < b", 0);
-    PrintNativePageHisto(out, records.free_unbacked_histo, type,
-                         "hps with a <= # of free AND unbacked < b", 0);
-    PrintNativePageHisto(out, records.free_swapped_histo, type,
-                         "hps with a <= # of free AND swapped < b", 0);
-    PrintNativePageHisto(out, records.free_stale_histo, type,
-                         "hps with a <= # of free AND stale < b", 0);
+    PrintHardwarePageHisto(out, records.unbacked_histo, type,
+                           "hps with a <= # of unbacked < b", 0);
+    PrintHardwarePageHisto(out, records.swapped_histo, type,
+                           "hps with a <= # of swapped < b", 0);
+    PrintHardwarePageHisto(out, records.stale_histo, type,
+                           "hps with a <= # of stale < b", 0);
+    PrintHardwarePageHisto(out, records.free_unbacked_histo, type,
+                           "hps with a <= # of free AND unbacked < b", 0);
+    PrintHardwarePageHisto(out, records.free_swapped_histo, type,
+                           "hps with a <= # of free AND swapped < b", 0);
+    PrintHardwarePageHisto(out, records.free_stale_histo, type,
+                           "hps with a <= # of free AND stale < b", 0);
 
     out.printf("\nHugePageFiller: %zu of %s free native pages are swapped.",
                records.num_free_swapped.raw_num(), TypeToStr(type));
@@ -827,13 +881,14 @@ class UsageInfo {
                        "low_occupancy_lifetime_histogram");
     PrintHisto(scoped, records.long_lived_hps_histo,
                "long_lived_hugepages_histogram", 0);
-    PrintNativePageHisto(scoped, records.unbacked_histo, "unbacked_histogram",
-                         0);
-    PrintNativePageHisto(scoped, records.swapped_histo, "swapped_histogram", 0);
-    PrintNativePageHisto(scoped, records.free_unbacked_histo,
-                         "free_unbacked_histogram", 0);
-    PrintNativePageHisto(scoped, records.free_swapped_histo,
-                         "free_swapped_histogram", 0);
+    PrintHardwarePageHisto(scoped, records.unbacked_histo, "unbacked_histogram",
+                           0);
+    PrintHardwarePageHisto(scoped, records.swapped_histo, "swapped_histogram",
+                           0);
+    PrintHardwarePageHisto(scoped, records.free_unbacked_histo,
+                           "free_unbacked_histogram", 0);
+    PrintHardwarePageHisto(scoped, records.free_swapped_histo,
+                           "free_swapped_histogram", 0);
     PrintSampledTrackers(scoped, type, "sampled_trackers", records);
     scoped.PrintI64("total_pages", records.total_pages);
     scoped.PrintI64("num_pages_hugepage_backed", records.hugepage_backed);
@@ -887,7 +942,7 @@ class UsageInfo {
     return it - lifetime_bucket_bounds_ - 1;
   }
 
-  int NativePageBucketNum(size_t page) {
+  int HardwarePageBucketNum(size_t page) {
     auto it =
         std::upper_bound(native_page_bucket_bounds_,
                          native_page_bucket_bounds_ + buckets_size_, page);
@@ -895,8 +950,8 @@ class UsageInfo {
     return it - native_page_bucket_bounds_ - 1;
   }
 
-  void PrintNativePageHisto(Printer& out, Histo h, Type type,
-                            absl::string_view blurb, size_t offset) {
+  void PrintHardwarePageHisto(Printer& out, Histo h, Type type,
+                              absl::string_view blurb, size_t offset) {
     out.printf("\nHugePageFiller: # of %s %s", TypeToStr(type), blurb);
     for (size_t i = 0; i < native_page_buckets_size_; ++i) {
       if (i % 6 == 0) {
@@ -907,8 +962,8 @@ class UsageInfo {
     out.printf("\n");
   }
 
-  void PrintNativePageHisto(PbtxtRegion& hpaa, Histo h, absl::string_view key,
-                            size_t offset) {
+  void PrintHardwarePageHisto(PbtxtRegion& hpaa, Histo h, absl::string_view key,
+                              size_t offset) {
     for (size_t i = 0; i < buckets_size_; ++i) {
       if (h[i] == 0) continue;
       auto hist = hpaa.CreateSubRegion(key);
@@ -1108,14 +1163,16 @@ class HugePageFiller {
       MemoryTag tag, MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND,
       MemoryModifyFunction& unback_without_lock ABSL_ATTRIBUTE_LIFETIME_BOUND,
       MemoryModifyFunction& collapse ABSL_ATTRIBUTE_LIFETIME_BOUND,
-      MemoryTagFunction& set_anon_vma_name ABSL_ATTRIBUTE_LIFETIME_BOUND);
+      MemoryTagFunction& set_anon_vma_name ABSL_ATTRIBUTE_LIFETIME_BOUND,
+      SubreleaseUnbackedMode subrelease_unbacked_mode);
 
   HugePageFiller(
       Clock clock, MemoryTag tag,
       MemoryModifyFunction& unback ABSL_ATTRIBUTE_LIFETIME_BOUND,
       MemoryModifyFunction& unback_without_lock ABSL_ATTRIBUTE_LIFETIME_BOUND,
       MemoryModifyFunction& collapse ABSL_ATTRIBUTE_LIFETIME_BOUND,
-      MemoryTagFunction& set_anon_vma_name ABSL_ATTRIBUTE_LIFETIME_BOUND);
+      MemoryTagFunction& set_anon_vma_name ABSL_ATTRIBUTE_LIFETIME_BOUND,
+      SubreleaseUnbackedMode subrelease_unbacked_mode);
 
   typedef TrackerType Tracker;
 
@@ -1260,10 +1317,11 @@ class HugePageFiller {
   // Returns true if we should back off from MADV_COLLAPSE. In case of high
   // collapse latency, this is used to reduce the frequency of collapse
   // attempts.
-  bool ShouldBackoffFromCollapse();
+  bool ShouldBackoffFromCollapse() ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
   // Based on the <latency>, updates the max backoff delay.
-  void UpdateMaxBackoffDelay(absl::Duration latency);
+  void UpdateMaxBackoffDelay(absl::Duration latency)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
   // Iterates through all hugepage trackers and applies different treatments.
   // Treatments applied include:
@@ -1289,6 +1347,14 @@ class HugePageFiller {
   // Utility function to release free pages from a given `page_tracker`
   // and handle accounting.
   Length HandleReleaseFree(PageTracker* page_tracker)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+
+  void OnCollapseSuccess(TrackerType* absl_nonnull pt)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
+
+  // Utility function to handle a non-hugepage backed `page_tracker` and
+  // mark its unmapped pages appropriately.
+  Length HandleUnbackedHugePage(PageTracker* page_tracker, PageBitmap unbacked)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(pageheap_lock);
 
  private:
@@ -1449,9 +1515,10 @@ class HugePageFiller {
   MemoryModifyFunction& unback_without_lock_;
   MemoryModifyFunction& collapse_;
   MemoryTagFunction& set_anon_vma_name_;
-  int max_backoff_delay_ = 1;
-  int current_backoff_delay_ = 0;
+  int max_backoff_delay_ ABSL_GUARDED_BY(pageheap_lock) = 1;
+  int current_backoff_delay_ ABSL_GUARDED_BY(pageheap_lock) = 0;
   uintptr_t rng_ = 0;
+  SubreleaseUnbackedMode subrelease_unbacked_mode_;
 };
 
 inline typename PageTracker::PageAllocation PageTracker::Get(
@@ -1484,38 +1551,34 @@ inline void PageTracker::SetAnonVmaName(MemoryTagFunction& set_anon_vma_name,
   set_anon_vma_name(Range(location_.first_page(), kPagesPerHugePage), name);
 }
 
-inline PageTracker::NativePageResidencyInfo PageTracker::CountInfoInHugePage(
-    Residency::SinglePageBitmaps bitmaps, ResidencyBitmap stale) const {
+inline PageTracker::HardwarePageResidencyInfo PageTracker::CountInfoInHugePage(
+    PageBitmap unbacked, PageBitmap swapped, PageBitmap stale) const {
   // TODO(b/424551232): Add support for the scenario when native page size is
   // larger than TCMalloc page size.
-  const size_t kNativePagesInHugePage = kHugePageSize / GetPageSize();
-  if (kNativePagesInHugePage < kPagesPerHugePage.raw_num()) {
+  const size_t kHardwarePagesInHugePage = kHugePageSize / GetPageSize();
+  if (kHardwarePagesInHugePage < kPagesPerHugePage.raw_num()) {
     return {.n_free_swapped = 0, .n_free_unbacked = 0};
   }
-  TC_ASSERT_LE(kNativePagesInHugePage, kMaxResidencyBits);
+  TC_ASSERT_LE(kHardwarePagesInHugePage, kMaxResidencyBits);
 
-  Bitmap<kMaxResidencyBits> unbacked = bitmaps.unbacked;
-  Bitmap<kMaxResidencyBits> swapped = bitmaps.swapped;
-  Bitmap<kPagesPerHugePage.raw_num()> free = free_.bits();
+  const Bitmap<kPagesPerHugePage.raw_num()> free = free_.bits();
 
-  TC_ASSERT_EQ(kNativePagesInHugePage % kPagesPerHugePage.raw_num(), 0);
-  const int shift = kNativePagesInHugePage / kPagesPerHugePage.raw_num();
+  TC_ASSERT_EQ(kHardwarePagesInHugePage % kPagesPerHugePage.raw_num(), 0);
+  const int shift = kHardwarePagesInHugePage / kPagesPerHugePage.raw_num();
   const int shift_bits = absl::bit_width<uint8_t>(shift - 1);
-  TC_ASSERT_LT((kNativePagesInHugePage - 1) >> shift_bits,
+  TC_ASSERT_LT((kHardwarePagesInHugePage - 1) >> shift_bits,
                kPagesPerHugePage.raw_num());
 
   size_t n_unbacked[2] = {0, 0};
   size_t n_swapped[2] = {0, 0};
   size_t n_stale[2] = {0, 0};
 
-  for (size_t i = 0; i < kNativePagesInHugePage; ++i) {
-    const int scaled_idx = i >> shift_bits;
-    bool is_free = !free.GetBit(scaled_idx);
-
-    n_swapped[is_free] += swapped.GetBit(i);
-    n_unbacked[is_free] += unbacked.GetBit(i);
-    n_stale[is_free] += stale.GetBit(i);
-  }
+  n_unbacked[0] = (free & unbacked).CountBits() * shift;
+  n_unbacked[1] = (~free & unbacked).CountBits() * shift;
+  n_swapped[0] = (free & swapped).CountBits() * shift;
+  n_swapped[1] = (~free & swapped).CountBits() * shift;
+  n_stale[0] = (free & stale).CountBits() * shift;
+  n_stale[1] = (~free & stale).CountBits() * shift;
 
   return {.n_free_swapped = n_swapped[1],
           .n_used_swapped = n_swapped[0],
@@ -1581,6 +1644,28 @@ inline Length PageTracker::ReleaseFree(MemoryModifyFunction& unback) {
   TC_ASSERT_LE(Length(released_count_), kPagesPerHugePage);
   TC_ASSERT_EQ(released_by_page_.CountBits(), released_count_);
   return Length(count);
+}
+
+inline Length PageTracker::MarkSubreleased(PageBitmap unbacked) {
+  PageBitmap free = free_.bits();
+
+  // TODO(b/525422238): The residency bitmap was captured outside of the
+  // lock. So, in a rare case, it's possible that the page was allocated,
+  // backed and then freed. So, the free page here is actually backed.
+  // While we currently ignore this case (resulting in underestimating
+  // RSS), we can potentially fix this by re-investigating the bitmaps
+  // and marking the pages back to backed to eventually fix this.
+  auto to_release = (~free) & (~released_by_page_) & unbacked;
+  released_by_page_ = released_by_page_ | to_release;
+
+  released_count_ += to_release.CountBits();
+  // Mark this is unbroken regardless of whether it had any unbacked free
+  // TCMalloc pages. Marking this will move this tracker to one of the
+  // released lists.
+  unbroken_ = false;
+  TC_ASSERT_LE(Length(released_count_), kPagesPerHugePage);
+  TC_ASSERT_EQ(released_by_page_.CountBits(), released_count_);
+  return Length(to_release.CountBits());
 }
 
 inline MemoryModifyStatus PageTracker::Collapse(
@@ -1658,18 +1743,20 @@ template <class TrackerType>
 inline HugePageFiller<TrackerType>::HugePageFiller(
     MemoryTag tag, MemoryModifyFunction& unback,
     MemoryModifyFunction& unback_without_lock, MemoryModifyFunction& collapse,
-    MemoryTagFunction& set_anon_vma_name)
+    MemoryTagFunction& set_anon_vma_name,
+    SubreleaseUnbackedMode subrelease_unbacked_mode)
     : HugePageFiller(Clock{.now = absl::base_internal::CycleClock::Now,
                            .freq = absl::base_internal::CycleClock::Frequency},
                      tag, unback, unback_without_lock, collapse,
-                     set_anon_vma_name) {}
+                     set_anon_vma_name, subrelease_unbacked_mode) {}
 
 // For testing with mock clock
 template <class TrackerType>
 inline HugePageFiller<TrackerType>::HugePageFiller(
     Clock clock, MemoryTag tag, MemoryModifyFunction& unback,
     MemoryModifyFunction& unback_without_lock, MemoryModifyFunction& collapse,
-    MemoryTagFunction& set_anon_vma_name)
+    MemoryTagFunction& set_anon_vma_name,
+    SubreleaseUnbackedMode subrelease_unbacked_mode)
     : size_(NHugePages(0)),
       fillerstats_tracker_(clock, absl::Minutes(60), absl::Minutes(5),
                            absl::Minutes(10)),
@@ -1678,7 +1765,8 @@ inline HugePageFiller<TrackerType>::HugePageFiller(
       unback_(unback),
       unback_without_lock_(unback_without_lock),
       collapse_(collapse),
-      set_anon_vma_name_(set_anon_vma_name) {
+      set_anon_vma_name_(set_anon_vma_name),
+      subrelease_unbacked_mode_(subrelease_unbacked_mode) {
   lifetime_bucket_bounds_[0] = 0;
   lifetime_bucket_bounds_[1] = 1;
   for (int i = 2; i <= kLifetimeBuckets; ++i) {
@@ -2495,6 +2583,7 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
       Clock clock, PageFlagsBase* pageflags, Residency* residency,
       MemoryModifyFunction& collapse, HugePageFiller<TrackerType>& page_filler,
       EnableCollapse enable_collapse,
+      SubreleaseUnbackedMode subrelease_unbacked_mode,
       EnableUnfilteredCollapse enable_unfiltered_collapse)
       : clock_(clock),
         pageflags_(pageflags),
@@ -2502,6 +2591,7 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
         collapse_(collapse),
         page_filler_(page_filler),
         enable_collapse_(enable_collapse),
+        subrelease_unbacked_mode_(subrelease_unbacked_mode),
         enable_unfiltered_collapse_(enable_unfiltered_collapse) {}
   ~HugePageUnbackedTrackerTreatment() override = default;
 
@@ -2609,6 +2699,7 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
     // kMaxSwappedPagesForCollapse respectively.
     const double max_collapse_cycles =
         absl::ToDoubleSeconds(kMaxCollapseLatencyThreshold) * clock_.freq();
+    const size_t pages_per_huge_page = kHugePageSize / GetPageSize();
     for (int i = 0; i < num_valid_trackers_; ++i) {
       PageTracker::HugePageResidencyState state;
       PageTracker* tracker = selected_trackers_[i];
@@ -2624,22 +2715,25 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
       // information.
       state.maybe_hugepage_backed = is_hugepage;
       if (!is_hugepage) {
-        state.bitmaps =
+        auto bitmaps =
             res->GetUnbackedAndSwappedBitmaps(tracker->location().start_addr());
-        if (pf) {
-          pf->GetSinglePageBitmaps(tracker->location().start_addr(),
-                                   state.stale);
-        }
+        state.unbacked = Scale<kPagesPerHugePage.raw_num()>(
+            bitmaps.unbacked, pages_per_huge_page, ReductionOp::kAll);
+        state.swapped = Scale<kPagesPerHugePage.raw_num()>(
+            bitmaps.swapped, pages_per_huge_page, ReductionOp::kAny);
+        auto single_page_bitmaps =
+            pf->GetSinglePageBitmaps(tracker->location().start_addr());
+        state.stale = Scale<kPagesPerHugePage.raw_num()>(
+            single_page_bitmaps.stale, pages_per_huge_page, ReductionOp::kAny);
 
         const bool backoff =
             treatment_stats_.collapse_time_max_cycles > max_collapse_cycles;
         if (enable_collapse_ == EnableCollapse::kEnabled && !backoff) {
-          bool should_collapse = enable_unfiltered_collapse_ ==
-                                     EnableUnfilteredCollapse::kEnabled ||
-                                 (state.bitmaps.swapped.CountBits() <
-                                      kMaxSwappedPagesForCollapse &&
-                                  state.bitmaps.unbacked.CountBits() <
-                                      kMaxUnbackedPagesForCollapse);
+          bool should_collapse =
+              enable_unfiltered_collapse_ ==
+                  EnableUnfilteredCollapse::kEnabled ||
+              (bitmaps.swapped.CountBits() < kMaxSwappedPagesForCollapse &&
+               bitmaps.unbacked.CountBits() < kMaxUnbackedPagesForCollapse);
           if (should_collapse) {
             state.maybe_hugepage_backed = TryUserspaceCollapse(tracker);
           } else {
@@ -2661,8 +2755,14 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
       PageTracker* tracker = residency_states_[i].tracker;
       TC_ASSERT_NE(tracker, nullptr);
       tracker->ClearDontFreeTracker(HugePageTreatmentType::kCollapse);
+      if (tracker->fully_freed()) {
+        continue;
+      }
       tracker->SetHugePageResidencyState(residency_states_[i].tracker_state);
       if (residency_states_[i].tracker_state.maybe_hugepage_backed) {
+        if (subrelease_unbacked_mode_ == SubreleaseUnbackedMode::kEnabled) {
+          page_filler_.OnCollapseSuccess(tracker);
+        }
         continue;
       }
 
@@ -2670,12 +2770,20 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
       // released the pageheap lock. Check that the longest free range is less
       // than kPagesPerHugePage to make sure it's valid to release from that
       // tracker.
-      if (!residency_states_[i].tracker_state.bitmaps.swapped.IsZero() &&
-          !tracker->fully_freed()) {
+      if (!residency_states_[i].tracker_state.swapped.IsZero()) {
         // TODO: b/425749361 - Clear swapped bit for pages that were freed.
         Length released_length = page_filler_.HandleReleaseFree(tracker);
         if (released_length > Length(0)) {
           treatment_stats_.treated_pages_subreleased +=
+              released_length.raw_num();
+        }
+      }
+
+      if (subrelease_unbacked_mode_ == SubreleaseUnbackedMode::kEnabled) {
+        Length released_length = page_filler_.HandleUnbackedHugePage(
+            tracker, residency_states_[i].tracker_state.unbacked);
+        if (released_length > Length(0)) {
+          treatment_stats_.treated_pages_unbacked_subreleased +=
               released_length.raw_num();
         }
       }
@@ -2690,6 +2798,8 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
     // reporting cumulative treated_pages_subreleased stat.
     stats.treated_pages_subreleased =
         treatment_stats_.treated_pages_subreleased;
+    stats.treated_pages_unbacked_subreleased =
+        treatment_stats_.treated_pages_unbacked_subreleased;
     stats.collapse_time_max_cycles =
         std::max(stats.collapse_time_max_cycles,
                  treatment_stats_.collapse_time_max_cycles);
@@ -2736,6 +2846,7 @@ class HugePageUnbackedTrackerTreatment final : public HugePageTreatment {
   HugePageTreatmentStats treatment_stats_;
   HugePageFiller<TrackerType>& page_filler_;
   EnableCollapse enable_collapse_;
+  SubreleaseUnbackedMode subrelease_unbacked_mode_;
 
   EnableUnfilteredCollapse enable_unfiltered_collapse_;
 };
@@ -2776,26 +2887,29 @@ inline void HugePageFiller<TrackerType>::TreatHugepageTrackers(
     enable_collapse = EnableCollapse::kDisabled;
     ++treatment_stats_.collapse_intervals_skipped;
   }
+  bool enable_subrelease_unbacked =
+      subrelease_unbacked_mode_ == SubreleaseUnbackedMode::kEnabled;
+
   SampledTrackerTreatment sampled_tracker_treatment(clock_, tag_,
                                                     set_anon_vma_name_);
   HugePageUnbackedTrackerTreatment<TrackerType> unbacked_tracker_treatment(
       clock_, pageflags, residency, collapse_, *this, enable_collapse,
-      enable_unfiltered_collapse);
+      subrelease_unbacked_mode_, enable_unfiltered_collapse);
 
-  // Collect up to kTotalTrackersToScan trackers from the regular sparse and
-  // dense lists. we also collect trackers from regular_alloc_partial_released_
-  // and donated_alloc_.
+  // Collect up to kTotalTrackersToScan trackers from our lists.
   regular_alloc_partial_released_[AccessDensityPrediction::kSparse].Iter(
       [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
+        sampled_tracker_treatment.SelectEligibleTrackers(pt);
         unbacked_tracker_treatment.SelectEligibleTrackers(pt);
       },
-      /*start=*/kChunks);
+      /*start=*/0);
 
   regular_alloc_partial_released_[AccessDensityPrediction::kDense].Iter(
       [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
+        sampled_tracker_treatment.SelectEligibleTrackers(pt);
         unbacked_tracker_treatment.SelectEligibleTrackers(pt);
       },
-      /*start=*/kChunks);
+      /*start=*/0);
 
   donated_alloc_.Iter(
       [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
@@ -2817,26 +2931,21 @@ inline void HugePageFiller<TrackerType>::TreatHugepageTrackers(
       },
       /*start=*/0);
 
-  regular_alloc_partial_released_[AccessDensityPrediction::kSparse].Iter(
-      [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
-        sampled_tracker_treatment.SelectEligibleTrackers(pt);
-      },
-      /*start=*/0);
-
-  regular_alloc_partial_released_[AccessDensityPrediction::kDense].Iter(
-      [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
-        sampled_tracker_treatment.SelectEligibleTrackers(pt);
-      },
-      /*start=*/0);
   regular_alloc_released_[AccessDensityPrediction::kSparse].Iter(
       [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
         sampled_tracker_treatment.SelectEligibleTrackers(pt);
+        if (enable_subrelease_unbacked) {
+          unbacked_tracker_treatment.SelectEligibleTrackers(pt);
+        }
       },
       /*start=*/0);
 
   regular_alloc_released_[AccessDensityPrediction::kDense].Iter(
       [&](TrackerType& pt) GOOGLE_MALLOC_SECTION {
         sampled_tracker_treatment.SelectEligibleTrackers(pt);
+        if (enable_subrelease_unbacked) {
+          unbacked_tracker_treatment.SelectEligibleTrackers(pt);
+        }
       },
       /*start=*/0);
 
@@ -2845,14 +2954,14 @@ inline void HugePageFiller<TrackerType>::TreatHugepageTrackers(
   unbacked_tracker_treatment.Treat();
 
   HugePageTreatmentStats stats = unbacked_tracker_treatment.GetStats();
+
+  // Lock the pageheap lock and update residency information in the tracker.
+  pageheap_lock.lock();
   if (stats.collapse_attempted > 0) {
     absl::Duration max_collapse_latency = absl::Milliseconds(
         stats.collapse_time_max_cycles * 1000 / clock_.freq());
     UpdateMaxBackoffDelay(max_collapse_latency);
   }
-
-  // Lock the pageheap lock and update residency information in the tracker.
-  pageheap_lock.lock();
   sampled_tracker_treatment.Restore();
   unbacked_tracker_treatment.Restore();
 
@@ -2875,6 +2984,26 @@ inline Length HugePageFiller<TrackerType>::HandleReleaseFree(
   unmapping_unaccounted_ += released_length;
   AddToFillerList(tracker);
   return released_length;
+}
+
+template <class TrackerType>
+inline void HugePageFiller<TrackerType>::OnCollapseSuccess(TrackerType* pt) {
+  if (pt->unbroken()) return;
+  RemoveFromFillerList(pt);
+  pt->set_unbroken(/*status=*/true);
+  AddToFillerList(pt);
+}
+
+template <class TrackerType>
+inline Length HugePageFiller<TrackerType>::HandleUnbackedHugePage(
+    PageTracker* tracker, PageBitmap unbacked) {
+  RemoveFromFillerList(tracker);
+  Length unmapped_length = tracker->MarkSubreleased(unbacked);
+  subrelease_stats_.total_pages_subreleased += unmapped_length;
+  unmapped_ += unmapped_length;
+  unmapping_unaccounted_ += unmapped_length;
+  AddToFillerList(tracker);
+  return unmapped_length;
 }
 
 template <class TrackerType>
@@ -3290,6 +3419,9 @@ inline void HugePageFiller<TrackerType>::PrintInPbtxt(
     huge_page_treatment_region.PrintI64(
         "treated_pages_subreleased",
         treatment_stats_.treated_pages_subreleased);
+    huge_page_treatment_region.PrintI64(
+        "treated_pages_unbacked_subreleased",
+        treatment_stats_.treated_pages_unbacked_subreleased);
   }
   PrintLifetimeHistoInPbtxt(hpaa,
                             lifetime_histo_[AccessDensityPrediction::kDense],
@@ -3388,7 +3520,9 @@ inline void HugePageFiller<TrackerType>::RemoveFromFillerList(TrackerType* pt) {
                                            : AccessDensityPrediction::kSparse;
   size_t i = ListFor(longest, IndexFor(*pt), type, pt->nallocs());
 
-  if (!pt->released()) {
+  if (!pt->released() &&
+      (pt->unbroken() ||
+       subrelease_unbacked_mode_ == SubreleaseUnbackedMode::kDisabled)) {
     regular_alloc_[type].Remove(pt, i);
   } else if (pt->free_pages() <= pt->released_pages()) {
     regular_alloc_released_[type].Remove(pt, i);
@@ -3436,7 +3570,9 @@ inline void HugePageFiller<TrackerType>::AddToFillerList(TrackerType* pt) {
                                            : AccessDensityPrediction::kSparse;
   size_t i = ListFor(longest, IndexFor(*pt), type, pt->nallocs());
 
-  if (!pt->released()) {
+  if (!pt->released() &&
+      (pt->unbroken() ||
+       subrelease_unbacked_mode_ == SubreleaseUnbackedMode::kDisabled)) {
     regular_alloc_[type].Add(pt, i);
   } else if (pt->free_pages() <= pt->released_pages()) {
     regular_alloc_released_[type].Add(pt, i);
